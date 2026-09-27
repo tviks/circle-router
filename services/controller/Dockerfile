@@ -12,16 +12,20 @@ RUN npm run build
 # ── 2. Бинарь xray: нужен контроллеру для `xray api statsquery` ──────────────
 FROM debian:bookworm-slim AS xraybin
 ARG XRAY_VERSION=v26.3.27
-ARG TARGETARCH=amd64
+# BuildKit подставляет TARGETARCH сам; у классического билдера её нет, поэтому
+# без дефолта — иначе на arm64-плате в образ попадёт amd64-бинарь и `xray run
+# -test` падает с `exec format error`, из-за чего config.json не пишется вовсе.
+ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl unzip \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
-    case "${TARGETARCH}" in \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${arch}" in \
       amd64) zip="Xray-linux-64.zip" ;; \
       arm64) zip="Xray-linux-arm64-v8a.zip" ;; \
-      arm)   zip="Xray-linux-arm32-v7a.zip" ;; \
-      *) echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; \
+      arm|armhf|armel) zip="Xray-linux-arm32-v7a.zip" ;; \
+      *) echo "unsupported arch ${arch}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/xray.zip \
       "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${zip}"; \
