@@ -122,11 +122,18 @@ def _cache_path(url):
 def _source_text(url, download):
     path = _cache_path(url)
     if download:
-        with httpx.Client(follow_redirects=True, timeout=120,
-                          headers={"User-Agent": "circle-router/1.0"}) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            text = resp.text
+        try:
+            with httpx.Client(follow_redirects=True, timeout=120,
+                              headers={"User-Agent": "circle-router/1.0"}) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                text = resp.text
+        except Exception:
+            # Как и у блокировщика: сбой сети не должен обнулять списки.
+            if path.exists():
+                log.warning("список %s не обновился, беру кеш", url)
+                return path.read_text(encoding="utf-8")
+            raise
         path.write_text(text, encoding="utf-8")
         return text
     if path.exists():

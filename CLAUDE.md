@@ -29,6 +29,8 @@ services/controller/      FastAPI-мозг, privileged; в образе есть
   app/node_tune.py        подбор протокола: Tester + раунды A–D, score()
   app/nodes.py            задачи (deploy/tune/apply/restart/uninstall), советник
   app/node_monitor.py     метрики нод: поток `cat /proc` по SSH
+  app/proxylists.py       умный прокси: списки доменов/подсетей → dnsmasq nftset + nft-сеты
+  app/wanspeed.py         общий спидтест (curl, 4 потока; direct и через health-in)
 web/                      React + Vite + Tailwind; страницы в src/pages, UI-кит в
                           src/components/ui.jsx, API-клиент src/lib/api.js
 ```
@@ -48,6 +50,17 @@ web/                      React + Vite + Tailwind; страницы в src/pages
   ключ `node_build.cand_key()` (продублирован в Nodes.jsx как candKey).
 - Длинные операции — фоновые потоки с журналом (`nodes._jobs`), UI опрашивает.
 
+## Боевой роутер (NanoPi R3S, Armbian 24.04, aarch64)
+
+- Проект в `/root/circle-router` (git-клон; деплой — git bundle + checkout ветки,
+  `.env` и `data/` не трогать). LAN `end0` 192.168.11.1, WAN `enp1s0` + PPPoE `ppp0`.
+- Включён умный прокси (`smart_proxy.enabled`), flowtable, RPS. Сборка образов идёт
+  прямо на плате (npm build ~ минуты).
+- Хост резолвит через systemd-resolved → `resolved.conf.d/circle.conf`; должен
+  смотреть в публичные DNS, не в 192.168.11.1 (см. README «DNS самого роутера»).
+- Из Git Bash к роутеру: paramiko-скрипт в scratchpad; пути вида `/tmp/x` в аргументах
+  портит MSYS — ставить `MSYS_NO_PATHCONV=1`.
+
 ## Проверено на практике (xray 26.3.27)
 
 - Reality: `chrome/firefox/safari/edge/ios` работают, `android` — нет,
@@ -55,6 +68,10 @@ web/                      React + Vite + Tailwind; страницы в src/pages
 - `xray tls ping` всегда rc=0 — успех по тексту `Handshake succeeded` после «with SNI».
 - `.dgst`: строка `SHA2-256= <hex>`.
 - Reality на не-443 порту — ядро пишет warning про бан IP; gRPC и SS помечены deprecated.
+- Balancer с `fallbackTag` + observatory: до первой пробы трафик идёт в fallback,
+  после — в живой selector; при мёртвом selector — в fallback. Проверено локально.
+- С этого Windows-ПК наружу не ходит обычный DNS (UDP/TCP 53) — в локальных
+  тестах резолвера использовать DoH.
 
 ## Локальная проверка без роутера (Windows)
 

@@ -15,6 +15,7 @@ import { usePoll } from '../lib/hooks'
 import { bytes, duration, rate } from '../lib/format'
 import { HistoryChart, SpeedChart } from '../components/charts'
 import { ServerHealth } from '../components/system'
+import { WanSpeedCard } from '../components/wanspeed'
 import { Card, Chip, Dot, Spinner, StatTile, Toggle, useToast } from '../components/ui'
 
 const RANGES = [
@@ -168,6 +169,8 @@ export default function Overview({ status, refreshStatus }) {
           </div>
         </Card>
       </div>
+
+      <WanSpeedCard />
 
       <ServerHealth system={system} />
 

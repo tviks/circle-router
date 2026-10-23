@@ -37,11 +37,11 @@ RUN set -eux; \
 FROM python:3.12-slim-bookworm
 
 # nftables/iproute2 — правила и роутинг на хосте; ppp + pppoe — WAN по PPPoE;
-# kmod — modprobe для nf_tproxy и pppoe.
+# kmod — modprobe для nf_tproxy и pppoe; curl — общий спидтест (wanspeed.py).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       nftables iproute2 iputils-ping kmod procps ppp pppoe ca-certificates \
-      conntrack tcpdump \
+      conntrack tcpdump curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

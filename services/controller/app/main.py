@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from . import (adblock, apply, auth, db, dnslog, dnsmasq_cfg, dockerctl,
                firewall, geodat, netctl, node_monitor, nodes, pppoe, proxylists,
                settings, speedtest, state, stats, subscription, sysinfo, tunnel,
-               xray_build, xray_url)
+               wanspeed, xray_build, xray_url)
 
 logging.basicConfig(
     level=os.environ.get("CR_LOG_LEVEL", "INFO"),
@@ -63,6 +63,11 @@ class PasswordChangeRequest(BaseModel):
 
 class SpeedTestRequest(BaseModel):
     server_ids: list[str] | None = None
+
+
+class WanSpeedRequest(BaseModel):
+    paths: list[str] | None = None
+    duration: int = Field(default=10, ge=5, le=30)
 
 
 class NodeCreate(BaseModel):
@@ -707,6 +712,23 @@ def speedtest_start(payload: SpeedTestRequest, _: str = Depends(auth.require_use
         raise HTTPException(status_code=400, detail="нечего проверять")
     try:
         return speedtest.start(targets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ── общий спидтест канала ────────────────────────────────────────────────────
+
+@app.get("/api/wanspeed")
+def wanspeed_status(_: str = Depends(auth.require_user)):
+    return wanspeed.status()
+
+
+@app.post("/api/wanspeed")
+def wanspeed_start(payload: WanSpeedRequest, _: str = Depends(auth.require_user)):
+    try:
+        return wanspeed.start(payload.paths, payload.duration)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

@@ -72,6 +72,10 @@ export const api = {
   speedtestStatus: () => request('/speedtest'),
   speedtestStart: (server_ids) => request('/speedtest', { method: 'POST', body: { server_ids } }),
 
+  wanspeed: () => request('/wanspeed'),
+  wanspeedStart: (paths, duration = 10) =>
+    request('/wanspeed', { method: 'POST', body: { paths, duration } }),
+
   nodes: () => request('/nodes'),
   createNode: (payload) => request('/nodes', { method: 'POST', body: payload }),
   editNode: (id, payload) => request(`/nodes/${id}`, { method: 'PUT', body: payload }),

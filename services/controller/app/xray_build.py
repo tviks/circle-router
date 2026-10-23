@@ -16,6 +16,12 @@ log = logging.getLogger("circle.xray")
 DNS_INBOUND_PORT = 5300
 # Тег, под которым в роутинг попадают запросы встроенного резолвера xray.
 DNS_CLIENT_TAG = "dns-internal"
+DNS_BALANCER = "dns-via-vpn"
+
+
+def _dns_failover(cfg):
+    """Резолвер уходит на direct при мёртвом туннеле, если не включён kill switch."""
+    return bool((cfg.get("failover") or {}).get("enabled", True))
 
 # HTTP-инбаунд монитора туннеля (см. tunnel.py). Только на loopback.
 HEALTH_PORT = 10809
@@ -70,7 +76,15 @@ def routing_rules(cfg, vpn_enabled):
     # Собственные запросы резолвера xray — строго через VPN. Иначе они
     # попадают под правило «UDP напрямую», а провайдер подменяет ответы даже
     # от 8.8.8.8: на заблокированные домены прилетает NXDOMAIN.
-    rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG], "outboundTag": "proxy"})
+    if _dns_failover(cfg):
+        # …но если туннель умер, резолвер не должен умереть вместе с ним:
+        # балансировщик с одним участником и запасным direct. Иначе в обходе
+        # (tunnel.py) у клиентов перестают резолвиться домены из списков, а в
+        # режиме «весь DNS через VPN» — вообще все.
+        rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG],
+                      "balancerTag": DNS_BALANCER})
+    else:
+        rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG], "outboundTag": "proxy"})
 
     # DNS-запросы (и локальный инбаунд, и всё, что клиенты шлют на чужой :53)
     # отдаём встроенному резолверу xray.
@@ -207,8 +221,22 @@ def build(cfg):
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {"domainStrategy": domain_strategy,
+                    **({"balancers": [{"tag": DNS_BALANCER, "selector": ["proxy"],
+                                       "fallbackTag": "direct",
+                                       "strategy": {"type": "leastPing"}}]}
+                       if vpn_enabled and _dns_failover(cfg) else {}),
                     "rules": routing_rules(cfg, vpn_enabled)},
     }
+    if vpn_enabled and _dns_failover(cfg):
+        # Observatory решает, жив ли proxy для балансировщика резолвера. До
+        # первой пробы (секунды после рестарта) запросы идут через direct.
+        probe = ((cfg.get("failover") or {}).get("probe_urls") or [None])[0]
+        config["observatory"] = {
+            "subjectSelector": ["proxy"],
+            "probeUrl": probe or "https://www.gstatic.com/generate_204",
+            "probeInterval": "10s",
+            "enableConcurrency": True,
+        }
     return config, vpn_enabled, error
 
 
