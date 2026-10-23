@@ -12,8 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (adblock, apply, auth, db, dnslog, dnsmasq_cfg, dockerctl,
-               firewall, geodat, netctl, pppoe, settings, speedtest, state,
-               stats, subscription, sysinfo, xray_build, xray_url)
+               firewall, geodat, netctl, node_monitor, nodes, pppoe, settings,
+               speedtest, state, stats, subscription, sysinfo, tunnel,
+               xray_build, xray_url)
 
 logging.basicConfig(
     level=os.environ.get("CR_LOG_LEVEL", "INFO"),
@@ -28,7 +29,7 @@ app = FastAPI(title="circle-router", docs_url=None, redoc_url=None)
 # Ключи конфига, которые панель имеет право менять.
 EDITABLE = {"vpn_enabled", "bypass", "force_proxy", "wan", "lan", "dhcp", "dns",
             "tproxy", "firewall", "uplink_access", "port_forward", "adblock",
-            "speedtest", "block_quic", "log_level"}
+            "speedtest", "block_quic", "log_level", "failover"}
 
 
 # ── схемы запросов ───────────────────────────────────────────────────────────
@@ -62,6 +63,33 @@ class PasswordChangeRequest(BaseModel):
 
 class SpeedTestRequest(BaseModel):
     server_ids: list[str] | None = None
+
+
+class NodeCreate(BaseModel):
+    name: str = Field(default="", max_length=60)
+    host: str = Field(max_length=255)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_user: str = Field(default="root", max_length=64)
+    password: str | None = None
+    private_key: str | None = None
+    sni: list[str] = []
+    activate: bool = True
+    tune: dict | None = None
+
+
+class NodeUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=60)
+    sni: list[str] | None = None
+    tune: dict | None = None
+
+
+class NodeCredentials(BaseModel):
+    password: str | None = None
+    private_key: str | None = None
+
+
+class NodeApplyRequest(BaseModel):
+    key: str | None = None
 
 
 # ── вспомогательное ──────────────────────────────────────────────────────────
@@ -153,6 +181,8 @@ def status(_: str = Depends(auth.require_user)):
             "routing_active": firewall.tproxy_active(),
             "xray_listening": apply.xray_listening(int(tproxy["port"])),
             "watchdog_state": apply.watchdog.state,
+            "failover_enabled": bool((cfg.get("failover") or {}).get("enabled", True)),
+            "tunnel": tunnel.monitor.snapshot(),
             "active_server": {"id": server.get("id"), "name": server.get("name")}
             if server else None,
         },
@@ -212,6 +242,8 @@ def get_config(_: str = Depends(auth.require_user)):
     safe["wan"] = dict(cfg["wan"])
     safe["wan"]["pppoe"] = dict(cfg["wan"]["pppoe"])
     safe["wan"]["pppoe"]["password"] = "••••••" if cfg["wan"]["pppoe"].get("password") else ""
+    # Ноды живут в своём API: в них ключи Reality и сертификаты.
+    safe.pop("nodes", None)
     return safe
 
 
@@ -342,9 +374,13 @@ def test_server(server_id: str, _: str = Depends(auth.require_user)):
     if not server:
         raise HTTPException(status_code=404, detail="сервер не найден")
     try:
-        host, port = xray_url.endpoint(xray_build.outbound_for(server))
+        outbound = xray_build.outbound_for(server)
+        host, port = xray_url.endpoint(outbound)
     except Exception as exc:                           # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"не разобрал сервер: {exc}")
+    if outbound.get("protocol") == "hysteria":
+        return {"ok": False, "error": "QUIC/UDP: TCP-проба неприменима, используйте замер скорости",
+                "host": host, "port": port}
 
     started = time.perf_counter()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -395,6 +431,158 @@ def import_servers(payload: ImportRequest, _: str = Depends(auth.require_user)):
 
     cfg = state.update(mutate)
     return {"ok": True, "imported": len(servers), "total": len(cfg["servers"])}
+
+
+# ── свои ноды ────────────────────────────────────────────────────────────────
+
+def _node_or_404(node_id):
+    try:
+        return nodes.get(node_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="нода не найдена")
+
+
+def _start_job(node_id, kind, **kwargs):
+    try:
+        return nodes.start(node_id, kind, **kwargs)
+    except nodes.JobBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _clean_sni(values):
+    result = []
+    for value in values or []:
+        value = value.strip().lower()
+        if not value:
+            continue
+        if any(ch in value for ch in " /:") or "." not in value:
+            raise HTTPException(status_code=400, detail=f"не похоже на домен: {value}")
+        if "apple" in value or "icloud" in value:
+            raise HTTPException(status_code=400,
+                                detail="apple/icloud в Reality ядро не любит, такие SNI банят первыми")
+        if value not in result:
+            result.append(value)
+    return result
+
+
+@app.get("/api/nodes")
+def list_nodes(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    result = []
+    for node in cfg.get("nodes") or []:
+        item = nodes.public(node, cfg)
+        item["metrics"], _history = node_monitor.monitor.snapshot(node["id"])
+        result.append(item)
+    return {"nodes": result, "busy": nodes.any_running()}
+
+
+@app.post("/api/nodes")
+def create_node(payload: NodeCreate, _: str = Depends(auth.require_user)):
+    host = payload.host.strip()
+    if not host or any(ch in host for ch in " /@"):
+        raise HTTPException(status_code=400, detail="укажите IP или имя сервера")
+    if not (payload.password or payload.private_key):
+        raise HTTPException(status_code=400, detail="нужен пароль или приватный ключ")
+    if nodes.any_running():
+        raise HTTPException(status_code=409, detail="дождитесь окончания текущей задачи")
+    node = nodes.create({
+        "name": payload.name.strip() or host, "host": host,
+        "ssh_port": payload.ssh_port, "ssh_user": payload.ssh_user.strip() or "root",
+        "sni": _clean_sni(payload.sni), "activate": payload.activate,
+        "tune": {k: v for k, v in (payload.tune or {}).items() if k in nodes.DEFAULT_TUNE},
+    })
+    _start_job(node["id"], "deploy", password=payload.password,
+               private_key=payload.private_key)
+    return {"ok": True, "node": nodes.public(node, state.load())}
+
+
+@app.put("/api/nodes/{node_id}")
+def edit_node(node_id: str, payload: NodeUpdate, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    sni = _clean_sni(payload.sni) if payload.sni is not None else None
+
+    def mutate(node, cfg):
+        if payload.name is not None and payload.name.strip():
+            node["name"] = payload.name.strip()
+            server = next((s for s in cfg["servers"] if s["id"] == node.get("server_id")), None)
+            if server and node.get("profile"):
+                label = nodes.nb.TRANSPORTS[node["profile"]["transport"]]["label"]
+                server["name"] = f"{node['name']} · {label}"
+        if sni is not None:
+            node["sni"] = sni
+        if payload.tune:
+            tune = {**nodes.DEFAULT_TUNE, **(node.get("tune") or {})}
+            for key, value in payload.tune.items():
+                if key in nodes.DEFAULT_TUNE:
+                    tune[key] = value
+            tune["interval_hours"] = min(max(float(tune["interval_hours"]), 1), 168)
+            tune["speed_seconds"] = min(max(int(tune["speed_seconds"]), 3), 15)
+            tune["improve_pct"] = min(max(float(tune["improve_pct"]), 5), 200)
+            node["tune"] = tune
+
+    node = nodes.update(node_id, mutate)
+    return {"ok": True, "node": nodes.public(node, state.load())}
+
+
+@app.post("/api/nodes/{node_id}/deploy")
+def redeploy_node(node_id: str, payload: NodeCredentials,
+                  _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "deploy", password=payload.password,
+                                          private_key=payload.private_key)}
+
+
+@app.post("/api/nodes/{node_id}/tune")
+def tune_node(node_id: str, _: str = Depends(auth.require_user)):
+    node = _node_or_404(node_id)
+    if node.get("status") != "ready":
+        raise HTTPException(status_code=400, detail="нода ещё не развёрнута")
+    return {"ok": True, "job": _start_job(node_id, "tune")}
+
+
+@app.post("/api/nodes/{node_id}/apply")
+def apply_node_profile(node_id: str, payload: NodeApplyRequest,
+                       _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "apply", key=payload.key)}
+
+
+@app.post("/api/nodes/{node_id}/restart")
+def restart_node(node_id: str, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "restart")}
+
+
+@app.post("/api/nodes/{node_id}/forget-host-key")
+def forget_host_key(node_id: str, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    nodes.update(node_id, lambda n, _: n.update({"host_key": None}))
+    return {"ok": True}
+
+
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str, wipe: bool = True, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "uninstall", wipe=wipe)}
+
+
+@app.get("/api/nodes/{node_id}/metrics")
+def node_metrics(node_id: str, _: str = Depends(auth.require_user)):
+    node = _node_or_404(node_id)
+    cfg = state.load()
+    latest, history = node_monitor.monitor.snapshot(node_id)
+    active = bool(node.get("server_id")) and cfg.get("active_server") == node["server_id"]
+    link = stats.sampler.snapshot(150) if active else []
+    return {
+        "latest": latest,
+        "history": history,
+        "active": active,
+        "tunnel": tunnel.monitor.snapshot() if active else None,
+        "tunnel_series": tunnel.monitor.series() if active else [],
+        "throughput": [{"ts": p["ts"], "down": p.get("proxy_down_rate", 0),
+                        "up": p.get("proxy_up_rate", 0)} for p in link
+                       if "proxy_down_rate" in p],
+    }
 
 
 # ── клиенты и метрики ────────────────────────────────────────────────────────
@@ -552,7 +740,10 @@ def on_startup():
     except Exception:                                  # noqa: BLE001
         log.exception("первичное применение конфигурации не удалось")
     stats.sampler.start()
+    tunnel.monitor.start()
     apply.watchdog.start()
+    node_monitor.monitor.start()
+    nodes.advisor.start()
     dnslog.reader.start()
     adblock.updater.start(on_change=lambda: dockerctl.restart(settings.DNSMASQ_CONTAINER))
 
@@ -560,6 +751,9 @@ def on_startup():
 @app.on_event("shutdown")
 def on_shutdown():
     apply.watchdog.stop()
+    tunnel.monitor.stop()
+    node_monitor.monitor.stop()
+    nodes.advisor.stop()
     stats.sampler.stop()
     dnslog.reader.stop()
     adblock.updater.stop()

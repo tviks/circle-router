@@ -6,7 +6,7 @@ import threading
 import time
 
 from . import (adblock, dnsmasq_cfg, dockerctl, firewall, netctl, pppoe,
-               settings, state, xray_build)
+               settings, state, tunnel, xray_build)
 from .shell import run
 
 log = logging.getLogger("circle.apply")
@@ -132,6 +132,7 @@ def reconcile(restart_services=True):
 
         if restart_services:
             ok, err = dockerctl.restart(settings.XRAY_CONTAINER)
+            tunnel.monitor.poke()
             steps.append("xray перезапущен" if ok else f"xray: {err}")
             if not ok:
                 errors.append(f"перезапуск xray: {err}")
@@ -203,21 +204,32 @@ class Watchdog:
         tproxy = cfg["tproxy"]
         # Ориентируемся на то, что реально лежит в конфиге xray: при откате на
         # direct галка «VPN включён» ещё стоит, а заворачивать уже некуда.
-        want = (bool(cfg.get("vpn_enabled"))
-                and xray_build.effective()["vpn"]
-                and state.server_has_target(state.active_server(cfg))
-                and xray_listening(int(tproxy["port"])))
+        xray_ready = (bool(cfg.get("vpn_enabled"))
+                      and xray_build.effective()["vpn"]
+                      and state.server_has_target(state.active_server(cfg))
+                      and xray_listening(int(tproxy["port"])))
+        # xray жив, но сервер за ним молчит (нода перезагружается, протокол
+        # меняется, провайдер режет) — тоже уводим LAN напрямую, если это
+        # не запрещено в настройках.
+        failover = bool((cfg.get("failover") or {}).get("enabled", True))
+        tunnel_ok = not failover or tunnel.monitor.healthy()
+        want = xray_ready and tunnel_ok
         active = firewall.tproxy_active() and netctl.tproxy_routing_active(
             int(tproxy["fwmark"]), int(tproxy["table"]))
 
         if want and not active:
             netctl.tproxy_routing_up(int(tproxy["fwmark"]), int(tproxy["table"]))
             firewall.apply_tproxy(cfg, True)
-            self._note("up", "xray поднялся — включаю TPROXY")
+            self._note("up", "туннель работает — включаю TPROXY")
         elif not want and active:
             firewall.apply_tproxy(cfg, False)
             netctl.tproxy_routing_down(int(tproxy["fwmark"]), int(tproxy["table"]))
-            self._note("down", "xray недоступен или VPN выключен — трафик напрямую")
+            if xray_ready:
+                self._note("failover", "туннель не отвечает — клиенты временно идут напрямую")
+            else:
+                self._note("down", "xray недоступен или VPN выключен — трафик напрямую")
+        elif not want and xray_ready and self.state != "failover":
+            self._note("failover", "туннель ещё не ответил — клиенты идут напрямую")
 
         # LAN-адрес мог снести networkd при событии на линке — возвращаем.
         lan = cfg["lan"]

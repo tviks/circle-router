@@ -7,6 +7,7 @@ import {
   LogOut,
   Menu,
   RefreshCw,
+  Server,
   ShieldBan,
   ShieldCheck,
   Terminal,
@@ -20,6 +21,7 @@ import { Dot, Spinner, useToast } from './components/ui'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
 import Vpn from './pages/Vpn'
+import Nodes from './pages/Nodes'
 import Network from './pages/Network'
 import Clients from './pages/Clients'
 import AdBlock from './pages/AdBlock'
@@ -28,6 +30,7 @@ import System from './pages/System'
 const PAGES = [
   { id: 'overview', label: 'Обзор', icon: LayoutDashboard, component: Overview },
   { id: 'vpn', label: 'VPN', icon: ShieldCheck, component: Vpn },
+  { id: 'nodes', label: 'Свои ноды', icon: Server, component: Nodes },
   { id: 'network', label: 'Сеть', icon: Cable, component: Network },
   { id: 'adblock', label: 'Блокировщик', icon: ShieldBan, component: AdBlock },
   { id: 'clients', label: 'Клиенты', icon: Users, component: Clients },
@@ -188,8 +191,16 @@ function Shell({ page, navigate, navOpen, setNavOpen, onLogout }) {
 function VpnBadge({ status }) {
   const vpn = status?.vpn
   const active = vpn?.routing_active && vpn?.xray_listening
-  const tone = active ? 'ok' : vpn?.enabled ? 'warn' : 'mute'
-  const text = active ? 'VPN активен' : vpn?.enabled ? 'VPN включён, но не поднят' : 'VPN выключен'
+  // xray работает, а туннель молчит — LAN временно ушёл напрямую.
+  const failover = vpn?.watchdog_state === 'failover' && vpn?.enabled && !active
+  const tone = active ? 'ok' : failover ? 'bad' : vpn?.enabled ? 'warn' : 'mute'
+  const text = active
+    ? 'VPN активен'
+    : failover
+      ? 'Туннель недоступен — напрямую'
+      : vpn?.enabled
+        ? 'VPN включён, но не поднят'
+        : 'VPN выключен'
   return (
     <div className="flex items-center gap-2 text-xs text-slate-400">
       <Dot tone={tone} pulse={active} />

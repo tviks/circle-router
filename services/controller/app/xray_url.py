@@ -333,9 +333,13 @@ def summarize(outbound):
         srv = (settings_.get("servers") or [{}])[0]
         s.update({"address": srv.get("address"), "port": srv.get("port"),
                   "method": srv.get("method")})
+    elif proto == "hysteria":
+        s.update({"address": settings_.get("address"), "port": settings_.get("port")})
 
     s["network"] = stream.get("network", "tcp")
     s["security"] = stream.get("security", "none")
+    if (stream.get("sockopt") or {}).get("dialerProxy"):
+        s["fragment"] = "tlshello"
     if stream.get("realitySettings"):
         r = stream["realitySettings"]
         pbk = r.get("publicKey") or ""
@@ -353,6 +357,8 @@ def summarize(outbound):
 def endpoint(outbound):
     """(host, port) аутбаунда — нужен для замера задержки до сервера."""
     settings_ = outbound.get("settings") or {}
+    if outbound.get("protocol") == "hysteria":
+        return settings_.get("address"), int(settings_.get("port") or 443)
     if outbound.get("protocol") in ("vless", "vmess"):
         v = (settings_.get("vnext") or [{}])[0]
         return v.get("address"), int(v.get("port") or 443)

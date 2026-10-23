@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   Download,
   Gauge,
+  LifeBuoy,
   Pencil,
   Plus,
   ServerCog,
@@ -12,6 +13,7 @@ import {
 
 import { api } from '../lib/api'
 import { useConfigDraft, usePoll } from '../lib/hooks'
+import { dateLabel } from '../lib/format'
 import {
   Card,
   Chip,
@@ -21,12 +23,14 @@ import {
   Modal,
   Spinner,
   TagList,
+  Toggle,
   useToast,
 } from '../components/ui'
+import { TunnelChip } from './Nodes'
 
 const EMPTY_SERVER = { name: '', url: '' }
 
-export default function Vpn({ refreshStatus }) {
+export default function Vpn({ status, refreshStatus }) {
   const toast = useToast()
   const { data, refresh } = usePoll(api.servers, 15000)
   const [editing, setEditing] = useState(null)
@@ -163,6 +167,8 @@ export default function Vpn({ refreshStatus }) {
         )}
       </Card>
 
+      <FailoverCard status={status} />
+
       <RoutingRules />
 
       <ServerModal
@@ -222,7 +228,11 @@ function ServerRow({
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium text-slate-100">{server.name}</span>
             {!server.valid && <Chip tone="bad">ошибка разбора</Chip>}
-            {server.outbound && !server.url && <Chip tone="info">Xray JSON</Chip>}
+            {server.node_id ? (
+              <Chip tone="info">своя нода</Chip>
+            ) : (
+              server.outbound && !server.url && <Chip tone="info">Xray JSON</Chip>
+            )}
           </div>
           <div className="mono mt-0.5 truncate text-xs text-slate-500">
             {summary.address
@@ -605,6 +615,114 @@ function RoutingRules() {
               placeholder="1.1.1.1/32"
             />
           </Field>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+function FailoverCard({ status }) {
+  const toast = useToast()
+  const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
+  const [busy, setBusy] = useState(false)
+  const tunnel = status?.vpn?.tunnel
+
+  const save = useCallback(async () => {
+    setBusy(true)
+    try {
+      const failover = {
+        ...draft.failover,
+        interval: Number(draft.failover.interval),
+        timeout: Number(draft.failover.timeout),
+        fail_threshold: Number(draft.failover.fail_threshold),
+        recover_threshold: Number(draft.failover.recover_threshold),
+      }
+      await api.patchConfig({ failover })
+      toast('Настройки обхода сохранены', 'ok')
+      await settle()
+    } catch (err) {
+      toast(err.message, 'bad', 9000)
+    } finally {
+      setBusy(false)
+    }
+  }, [draft, settle, toast])
+
+  if (!draft?.failover) return null
+  const fo = draft.failover
+  const set = (patch) => edit((d) => ({ ...d, failover: { ...d.failover, ...patch } }))
+  const events = [...(tunnel?.events ?? [])].reverse().slice(0, 6)
+  const detect = Math.round(fo.fail_threshold * (Number(fo.interval) + Number(fo.timeout)))
+
+  return (
+    <Card
+      title="Если туннель упал"
+      subtitle="xray жив, а сервер молчит — клиенты временно идут в интернет напрямую"
+      actions={
+        <>
+          <TunnelChip tunnel={tunnel} />
+          {dirty && <Chip tone="warn">не сохранено</Chip>}
+          <button className="btn-primary" onClick={save} disabled={busy || !dirty}>
+            {busy && <Spinner />} Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="space-y-4">
+          <Toggle
+            checked={fo.enabled}
+            onChange={(v) => set({ enabled: v })}
+            label="Переключать клиентов на прямой интернет"
+            description={
+              fo.enabled
+                ? `потеря туннеля замечается примерно за ${detect} с, возврат — после ${fo.recover_threshold} удачных проверок`
+                : 'выключено: при обрыве туннеля LAN останется без интернета (kill switch)'
+            }
+          />
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <Field label="Проверка, с">
+              <Input type="number" min={1} max={30} value={fo.interval} onChange={(e) => set({ interval: e.target.value })} />
+            </Field>
+            <Field label="Таймаут, с">
+              <Input type="number" min={1} max={15} value={fo.timeout} onChange={(e) => set({ timeout: e.target.value })} />
+            </Field>
+            <Field label="Провалов">
+              <Input type="number" min={1} max={10} value={fo.fail_threshold} onChange={(e) => set({ fail_threshold: e.target.value })} />
+            </Field>
+            <Field label="Успехов">
+              <Input type="number" min={1} max={10} value={fo.recover_threshold} onChange={(e) => set({ recover_threshold: e.target.value })} />
+            </Field>
+          </div>
+          <Field label="Адреса проверки" hint="запрос идёт через туннель; хватает ответа любого из первых двух">
+            <TagList values={fo.probe_urls} onChange={(v) => set({ probe_urls: v })} placeholder="http://cp.cloudflare.com/generate_204" />
+          </Field>
+        </div>
+
+        <div>
+          <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-slate-500">
+            <LifeBuoy size={13} /> Последние переключения
+          </div>
+          {events.length === 0 ? (
+            <p className="text-sm text-slate-600">Обрывов не было.</p>
+          ) : (
+            <ul className="space-y-2 text-xs">
+              {events.map((e) => (
+                <li key={`${e.ts}-${e.state}`} className="flex items-center gap-2">
+                  <span className="mono text-slate-600">{dateLabel(e.ts)}</span>
+                  <Chip tone={e.state === 'down' ? 'bad' : 'ok'}>
+                    {e.state === 'down' ? 'напрямую' : 'VPN вернулся'}
+                  </Chip>
+                  {e.error && <span className="truncate text-slate-500">{e.error}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {tunnel?.failovers_hour > 0 && (
+            <p className="mt-3 text-xs text-slate-500">
+              За последний час: {tunnel.failovers_hour}. Своя нода после трёх обрывов за час
+              перепроверит протоколы сама.
+            </p>
+          )}
         </div>
       </div>
     </Card>

@@ -37,6 +37,8 @@ export default function Overview({ status, refreshStatus }) {
   const current = live?.current ?? {}
   const vpn = status?.vpn
   const vpnActive = Boolean(vpn?.routing_active && vpn?.xray_listening)
+  const failover = vpn?.enabled && !vpnActive && vpn?.watchdog_state === 'failover'
+  const tunnel = vpn?.tunnel
 
   const toggleVpn = useCallback(
     async (next) => {
@@ -115,12 +117,30 @@ export default function Overview({ status, refreshStatus }) {
                 }
               />
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                <Chip tone={vpnActive ? 'ok' : vpn?.enabled ? 'warn' : 'mute'}>
-                  <Dot tone={vpnActive ? 'ok' : vpn?.enabled ? 'warn' : 'mute'} />
-                  {vpnActive ? 'TPROXY активен' : vpn?.enabled ? 'ожидает xray' : 'прямой роутинг'}
+                <Chip tone={vpnActive ? 'ok' : failover ? 'bad' : vpn?.enabled ? 'warn' : 'mute'}>
+                  <Dot tone={vpnActive ? 'ok' : failover ? 'bad' : vpn?.enabled ? 'warn' : 'mute'} />
+                  {vpnActive
+                    ? 'TPROXY активен'
+                    : failover
+                      ? 'обход: клиенты напрямую'
+                      : vpn?.enabled
+                        ? 'ожидает xray'
+                        : 'прямой роутинг'}
                 </Chip>
+                {vpnActive && tunnel?.latency_ms != null && (
+                  <Chip tone="mute">
+                    <span className="mono">{tunnel.latency_ms} мс</span> до выхода
+                  </Chip>
+                )}
                 {busy && <Spinner size={13} className="text-slate-500" />}
               </div>
+              {failover && (
+                <p className="mt-3 rounded-lg border border-rose-500/25 bg-rose-500/[0.08] px-3 py-2 text-xs text-rose-200">
+                  Сервер не отвечает{tunnel?.error ? ` (${tunnel.error})` : ''} — чтобы не терять
+                  связь, клиенты временно ходят в интернет напрямую. VPN вернётся сам, как только
+                  туннель оживёт.
+                </p>
+              )}
               {vpn?.enabled && !vpn?.effective && (
                 <p className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/[0.08] px-3 py-2 text-xs text-amber-200">
                   xray не принял конфигурацию сервера, работает прямой роутинг.

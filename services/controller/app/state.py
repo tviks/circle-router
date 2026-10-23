@@ -115,6 +115,19 @@ def _default_config():
             "url": "https://speed.cloudflare.com/__down?bytes=50000000",
             "duration": 8,
         },
+        # Туннель перестал отвечать — LAN временно идёт в интернет напрямую,
+        # пока нода или протокол не поднимутся (см. tunnel.py).
+        "failover": {
+            "enabled": True,
+            "interval": 3,
+            "timeout": 4,
+            "fail_threshold": 2,
+            "recover_threshold": 2,
+            "probe_urls": ["http://cp.cloudflare.com/generate_204",
+                           "http://www.gstatic.com/generate_204"],
+        },
+        # Свои VDS-ноды, развёрнутые из панели (см. nodes.py).
+        "nodes": [],
         "block_quic": True,
         "log_level": "warning",
     }

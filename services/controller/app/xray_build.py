@@ -15,6 +15,9 @@ log = logging.getLogger("circle.xray")
 # VPN напрямую с WAN-адреса.
 DNS_INBOUND_PORT = 5300
 
+# HTTP-инбаунд монитора туннеля (см. tunnel.py). Только на loopback.
+HEALTH_PORT = 10809
+
 # Что реально лежит в /etc/xray/config.json. Отличается от cfg["vpn_enabled"],
 # когда конфиг с сервером не прошёл проверку и мы откатились на direct.
 _effective = {"vpn": False, "error": None, "ts": 0}
@@ -37,8 +40,26 @@ def outbound_for(server):
     return None
 
 
+def extra_outbounds_for(server):
+    """Вспомогательные аутбаунды сервера (у своих нод — фрагментатор
+    ClientHello, через который основной аутбаунд устанавливает TCP)."""
+    result = []
+    for raw in (server or {}).get("extra_outbounds") or []:
+        if isinstance(raw, dict) and raw.get("tag"):
+            extra = json.loads(json.dumps(raw))
+            sockopt = (extra.get("streamSettings") or {}).get("sockopt")
+            if isinstance(sockopt, dict):
+                sockopt.pop("mark", None)
+            result.append(extra)
+    return result
+
+
 def routing_rules(cfg, vpn_enabled):
     rules = [{"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}]
+    if vpn_enabled:
+        # Служебный инбаунд монитора туннеля всегда уходит в proxy — мимо
+        # правил обхода, иначе проверка мерила бы прямой канал.
+        rules.append({"type": "field", "inboundTag": ["health-in"], "outboundTag": "proxy"})
 
     if not vpn_enabled:
         rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
@@ -127,12 +148,21 @@ def build(cfg):
             "settings": {"address": upstream[0], "port": 53, "network": "tcp,udp"},
         },
     ]
+    if vpn_enabled:
+        inbounds.append({
+            "tag": "health-in",
+            "listen": "127.0.0.1",
+            "port": HEALTH_PORT,
+            "protocol": "http",
+            "settings": {"allowTransparent": False},
+        })
 
     outbounds = []
     # Никакого sockopt.mark на аутбаунде: иначе собственные пакеты xray уйдут
     # в ту же policy-таблицу и закольцуются.
     if proxy_outbound and vpn_enabled:
         outbounds.append(proxy_outbound)
+        outbounds.extend(extra_outbounds_for(server))
     outbounds.append({"tag": "direct", "protocol": "freedom",
                       "settings": {"domainStrategy": "UseIP"}})
     outbounds.append({"tag": "block", "protocol": "blackhole"})

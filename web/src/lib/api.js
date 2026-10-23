@@ -72,6 +72,18 @@ export const api = {
   speedtestStatus: () => request('/speedtest'),
   speedtestStart: (server_ids) => request('/speedtest', { method: 'POST', body: { server_ids } }),
 
+  nodes: () => request('/nodes'),
+  createNode: (payload) => request('/nodes', { method: 'POST', body: payload }),
+  editNode: (id, payload) => request(`/nodes/${id}`, { method: 'PUT', body: payload }),
+  deleteNode: (id, wipe = true) => request(`/nodes/${id}?wipe=${wipe}`, { method: 'DELETE' }),
+  redeployNode: (id, credentials = {}) =>
+    request(`/nodes/${id}/deploy`, { method: 'POST', body: credentials }),
+  tuneNode: (id) => request(`/nodes/${id}/tune`, { method: 'POST' }),
+  applyNodeProfile: (id, key) => request(`/nodes/${id}/apply`, { method: 'POST', body: { key } }),
+  restartNode: (id) => request(`/nodes/${id}/restart`, { method: 'POST' }),
+  forgetNodeHostKey: (id) => request(`/nodes/${id}/forget-host-key`, { method: 'POST' }),
+  nodeMetrics: (id) => request(`/nodes/${id}/metrics`),
+
   logs: (service, tail = 300) => request(`/logs/${service}?tail=${tail}`),
   restartService: (service) => request(`/services/${service}/restart`, { method: 'POST' }),
   restartPppoe: () => request('/pppoe/restart', { method: 'POST' }),
