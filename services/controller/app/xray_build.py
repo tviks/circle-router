@@ -14,6 +14,8 @@ log = logging.getLogger("circle.xray")
 # уходит по тем же правилам маршрутизации, что и остальной трафик, а не мимо
 # VPN напрямую с WAN-адреса.
 DNS_INBOUND_PORT = 5300
+# Тег, под которым в роутинг попадают запросы встроенного резолвера xray.
+DNS_CLIENT_TAG = "dns-internal"
 
 # HTTP-инбаунд монитора туннеля (см. tunnel.py). Только на loopback.
 HEALTH_PORT = 10809
@@ -64,6 +66,11 @@ def routing_rules(cfg, vpn_enabled):
     if not vpn_enabled:
         rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
         return rules
+
+    # Собственные запросы резолвера xray — строго через VPN. Иначе они
+    # попадают под правило «UDP напрямую», а провайдер подменяет ответы даже
+    # от 8.8.8.8: на заблокированные домены прилетает NXDOMAIN.
+    rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG], "outboundTag": "proxy"})
 
     # DNS-запросы (и локальный инбаунд, и всё, что клиенты шлют на чужой :53)
     # отдаём встроенному резолверу xray.
@@ -172,6 +179,13 @@ def build(cfg):
         # xray берёт первый аутбаунд как дефолтный.
         outbounds.sort(key=lambda o: 0 if o["tag"] == "direct" else 1)
 
+    # В умном режиме в xray попадают только адреса, уже отобранные DNS-списком,
+    # так что IPIfNonMatch лишь добавлял бы DNS-запрос на каждое соединение,
+    # у которого сниффнутый домен не совпал с правилами. AsIs матчит ip-правила
+    # по настоящему адресу назначения — ровно то, что нужно.
+    smart = vpn_enabled and bool((cfg.get("smart_proxy") or {}).get("enabled"))
+    domain_strategy = "AsIs" if smart else "IPIfNonMatch"
+
     config = {
         "log": {
             "loglevel": (cfg.get("log_level") or "warning"),
@@ -186,10 +200,13 @@ def build(cfg):
                 "statsOutboundUplink": True, "statsOutboundDownlink": True,
             },
         },
-        "dns": {"servers": upstream + ["localhost"], "queryStrategy": "UseIPv4"},
+        # Без "localhost": системный резолвер хоста смотрит в наш же dnsmasq,
+        # а тот шлёт домены из списков обратно в xray — петля и таймауты.
+        "dns": {"servers": upstream, "queryStrategy": "UseIPv4",
+                "tag": DNS_CLIENT_TAG},
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "routing": {"domainStrategy": "IPIfNonMatch",
+        "routing": {"domainStrategy": domain_strategy,
                     "rules": routing_rules(cfg, vpn_enabled)},
     }
     return config, vpn_enabled, error

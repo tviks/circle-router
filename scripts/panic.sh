@@ -8,7 +8,7 @@ if docker exec circle-controller /app/panic.sh 2>/dev/null; then
 fi
 
 echo "Контроллер недоступен — чищу таблицы напрямую." >&2
-for spec in "inet circle_filter" "ip circle_nat" "ip circle_mangle" "inet circle_acct"; do
+for spec in "inet circle_filter" "ip circle_nat" "ip circle_mangle" "inet circle_acct" "netdev circle_acct"; do
     # shellcheck disable=SC2086
     sudo nft delete table $spec 2>/dev/null || true
 done

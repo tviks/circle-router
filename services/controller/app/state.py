@@ -29,6 +29,32 @@ def _default_config():
             "ips": [],
         },
         "force_proxy": {"geosite": [], "domains": [], "ips": []},
+        # Умный прокси: в xray заворачиваются только адреса заблокированных
+        # ресурсов, остальное идёт напрямую через ядро (см. proxylists.py).
+        "smart_proxy": {
+            "enabled": True,
+            "domain_lists": [
+                {"name": "itdoginfo: заблокированное в РФ", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst"},
+            ],
+            "subnet_lists": [
+                {"name": "Telegram", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/telegram.lst"},
+                {"name": "Meta (Instagram, Facebook, WhatsApp)", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/meta.lst"},
+                {"name": "Twitter / X", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/twitter.lst"},
+                {"name": "Discord", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/discord.lst"},
+            ],
+            "auto_update_hours": 24,
+            # Клиентский DNS на чужие серверы (8.8.8.8 из DHCP и т.п.)
+            # заворачивается на dnsmasq: иначе сет не наполнится.
+            "hijack_dns": True,
+            # DNS-over-TLS мимо роутера: Android в режиме «автоматически»
+            # откатится на обычный DNS, если 853 отвечает отказом.
+            "block_dot": True,
+        },
         "wan": {
             "interface": settings.DEFAULTS["wan_if"],
             "mode": "dhcp",

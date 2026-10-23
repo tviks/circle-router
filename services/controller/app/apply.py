@@ -1,12 +1,11 @@
 """Приведение системы к состоянию, описанному в router.json."""
 
 import logging
-import socket
 import threading
 import time
 
 from . import (adblock, dnsmasq_cfg, dockerctl, firewall, netctl, pppoe,
-               settings, state, tunnel, xray_build)
+               proxylists, settings, state, tunnel, xray_build)
 from .shell import run
 
 log = logging.getLogger("circle.apply")
@@ -121,6 +120,22 @@ def reconcile(restart_services=True):
             blocklist_changed = False
             errors.append(f"список блокировки: {exc}")
 
+        # Списки умного прокси — тоже из кеша; скачивает их proxylists.updater.
+        try:
+            proxy_changed, proxy_report = proxylists.build(cfg, download=False)
+            if proxy_report.get("disabled"):
+                steps.append("умный прокси выключен: в VPN идёт весь трафик")
+            else:
+                steps.append(f"умный прокси: {proxy_report['domains']} доменов, "
+                             f"{proxy_report['subnets']} подсетей")
+            for source in proxy_report.get("sources", []):
+                if not source.get("ok"):
+                    errors.append(f"список прокси «{source['name']}»: {source.get('error')}")
+        except Exception as exc:                       # noqa: BLE001
+            proxy_changed = False
+            errors.append(f"списки умного прокси: {exc}")
+        blocklist_changed = blocklist_changed or proxy_changed
+
         if dhcp_problems:
             # Писать конфиг с заведомо битым пулом нельзя: dnsmasq не стартует
             # и LAN останется без DHCP. Оставляем прошлый рабочий файл.
@@ -152,16 +167,25 @@ def _finish(ok, steps, errors):
 
 
 def xray_listening(port):
-    """Дешёвая проба: TPROXY-инбаунд принимает соединения?"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.3)
-    try:
-        sock.connect(("127.0.0.1", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
+    """Дешёвая проба: TPROXY-инбаунд слушает порт?
+
+    Смотрим таблицу сокетов, а не подключаемся: connect() на dokodemo-door
+    с followRedirect xray принимает за петлю («loopback connection
+    detected») — раз в секунду в лог и лишнее соединение внутри xray.
+    """
+    wanted = f":{port:04X}"
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii") as fh:
+                next(fh, None)
+                for line in fh:
+                    fields = line.split()
+                    # fields[1] — local_address:port, fields[3] — состояние (0A = LISTEN).
+                    if len(fields) > 3 and fields[3] == "0A" and fields[1].endswith(wanted):
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 class Watchdog:

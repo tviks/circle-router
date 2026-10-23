@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (adblock, apply, auth, db, dnslog, dnsmasq_cfg, dockerctl,
-               firewall, geodat, netctl, node_monitor, nodes, pppoe, settings,
-               speedtest, state, stats, subscription, sysinfo, tunnel,
+               firewall, geodat, netctl, node_monitor, nodes, pppoe, proxylists,
+               settings, speedtest, state, stats, subscription, sysinfo, tunnel,
                xray_build, xray_url)
 
 logging.basicConfig(
@@ -655,6 +655,35 @@ def adblock_update(_: str = Depends(auth.require_user)):
     return {"ok": True, "restarted": changed, **report}
 
 
+def _proxylists_changed(changed):
+    """Новые списки: статические подсети — в nft, домены — в dnsmasq."""
+    cfg = state.load()
+    if firewall.tproxy_active():
+        firewall.apply_tproxy(cfg, True)
+    if changed:
+        dockerctl.restart(settings.DNSMASQ_CONTAINER)
+
+
+@app.get("/api/smart-proxy")
+def smart_proxy_status(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    return {"config": cfg.get("smart_proxy"), "enabled": proxylists.enabled(cfg),
+            "status": proxylists.status()}
+
+
+@app.post("/api/smart-proxy/update")
+def smart_proxy_update(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    try:
+        changed, report = proxylists.update(cfg)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:                           # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc))
+    _proxylists_changed(changed)
+    return {"ok": True, "restarted": changed, **report}
+
+
 @app.post("/api/adblock/reset-stats")
 def adblock_reset_stats(_: str = Depends(auth.require_user)):
     dnslog.reader.reset()
@@ -746,6 +775,7 @@ def on_startup():
     nodes.advisor.start()
     dnslog.reader.start()
     adblock.updater.start(on_change=lambda: dockerctl.restart(settings.DNSMASQ_CONTAINER))
+    proxylists.updater.start(on_change=_proxylists_changed)
 
 
 @app.on_event("shutdown")
@@ -757,6 +787,7 @@ def on_shutdown():
     stats.sampler.stop()
     dnslog.reader.stop()
     adblock.updater.stop()
+    proxylists.updater.stop()
 
 
 @app.get("/healthz")

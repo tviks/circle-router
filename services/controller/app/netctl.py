@@ -18,6 +18,8 @@ log = logging.getLogger("circle.netctl")
 # Модули, без которых не взлетит TPROXY. Часть из них может быть вкомпилирована
 # в ядро — modprobe в этом случае просто молча отработает.
 REQUIRED_MODULES = ["nf_tproxy_ipv4", "nft_tproxy", "nft_socket", "nf_socket_ipv4",
+                    # flowtable: короткий путь для установленных соединений.
+                    "nf_flow_table_inet", "nft_flow_offload",
                     # drivetemp отдаёт температуру SATA-дисков через hwmon;
                     # без него у них просто не будет датчика.
                     "drivetemp"]
@@ -63,7 +65,40 @@ def prepare_host(lan_if, wan_if):
         results[f"net.ipv4.conf.{iface}.rp_filter"] = sysctl_set(
             f"net.ipv4.conf.{iface}.rp_filter", 0
         )
+    results["net.core.rps_sock_flow_entries"] = sysctl_set(
+        "net.core.rps_sock_flow_entries", RPS_SOCK_FLOW_ENTRIES)
+    for iface in filter(None, {lan_if, wan_if}):
+        enable_rps(iface)
     return results
+
+
+RPS_SOCK_FLOW_ENTRIES = 32768
+RPS_FLOW_CNT = 4096
+
+
+def iface_exists(name):
+    return bool(name) and (Path("/sys/class/net") / name).exists()
+
+
+def enable_rps(iface):
+    """Раздать обработку входящих пакетов по всем ядрам.
+
+    У встроенных сетевух ARM-плат одна аппаратная очередь, и без RPS весь
+    softirq приёма (а с PPPoE — ещё и разбор сессии) висит на одном ядре,
+    которое упирается в потолок задолго до гигабита. Ядро умеет хешировать
+    и PPPoE-кадры, так что распределение работает и на WAN.
+    """
+    queues = Path("/sys/class/net") / iface / "queues"
+    try:
+        cpus = os.cpu_count() or 1
+        mask = format((1 << cpus) - 1, "x")
+        for rx in queues.glob("rx-*"):
+            (rx / "rps_cpus").write_text(mask)
+            (rx / "rps_flow_cnt").write_text(str(RPS_FLOW_CNT))
+        return True
+    except OSError as exc:
+        log.warning("не удалось включить RPS на %s: %s", iface, exc)
+        return False
 
 
 def interfaces():
