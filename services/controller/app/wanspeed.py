@@ -58,7 +58,10 @@ def _vpn_available():
 def _curl(args, timeout):
     """curl с -w JSON. На таймауте (код 28) curl всё равно печатает счётчики —
     именно так и заканчивается каждый замер по времени."""
-    cmd = ["curl", "-s", "-o", os.devnull, "-w", "%{json}", "--connect-timeout", "10", *args]
+    # HTTP/1.1: на A55 мультиплексирование HTTP/2 стоит лишнего CPU и на
+    # потоке в /dev/null ничего не даёт — замерено на плате.
+    cmd = ["curl", "-s", "--http1.1", "-o", os.devnull, "-w", "%{json}",
+           "--connect-timeout", "10", *args]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 15)
     except subprocess.TimeoutExpired:
@@ -74,11 +77,18 @@ def _proxy_args(path):
 
 
 def _trace(path):
-    """Отклик и выход: несколько маленьких запросов, берём лучший."""
+    """Отклик и выход: несколько маленьких запросов, берём лучший.
+
+    Отклик — от конца TLS-рукопожатия до первого байта ответа, то есть один
+    круг запрос-ответ по готовому соединению. Время до первого байта целиком
+    включало бы TCP и TLS (на плате ~200 мс) и завышало бы «пинг» в разы.
+    Через VPN это честный отклик туннеля: соединение до прокси локальное.
+    """
     times, info = [], {}
     for _ in range(5):
-        cmd = ["curl", "-s", "--connect-timeout", "8", "-m", "10", *_proxy_args(path),
-               "-w", "\n@@%{time_starttransfer}", TRACE_URL]
+        cmd = ["curl", "-s", "--http1.1", "--connect-timeout", "8", "-m", "10",
+               *_proxy_args(path),
+               "-w", "\n@@%{time_appconnect} %{time_starttransfer}", TRACE_URL]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         except subprocess.TimeoutExpired:
@@ -86,7 +96,8 @@ def _trace(path):
         body, _, timing = proc.stdout.rpartition("\n@@")
         if proc.returncode != 0 or not body:
             continue
-        times.append(float(timing) * 1000)
+        appconnect, first_byte = (float(v) for v in timing.split())
+        times.append((first_byte - appconnect) * 1000)
         for line in body.splitlines():
             key, _, value = line.partition("=")
             if key in ("ip", "loc", "colo"):
