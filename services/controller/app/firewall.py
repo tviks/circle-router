@@ -453,6 +453,13 @@ def tproxy_ruleset(cfg, enabled):
     # Заворачиваем только транзит из LAN. Трафик, пришедший с WAN (в том
     # числе наш SSH), не трогаем вообще.
     if smart:
+        if (cfg.get("smart_proxy") or {}).get("hijack_dns", True):
+            # DNS — мимо TPROXY, к перехвату на dnsmasq. mangle срабатывает
+            # раньше nat: запрос на 8.8.8.8:53 (а 8.8.8.8 сам лежит в сете
+            # прокси) уходил в xray, ответ не попадал в nftset, и адреса
+            # видеосерверов YouTube шли напрямую под шейпер провайдера.
+            script.append(f'{chain} iifname "{lan_if}" meta l4proto {{ tcp, udp }} '
+                          "th dport 53 accept")
         for set_name in (proxylists.DYN_SET, proxylists.STATIC_SET):
             script.append(f'{chain} iifname "{lan_if}" ct state new '
                           f"ip daddr @{set_name} ct mark set {SMART_CT_MARK}")
