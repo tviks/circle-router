@@ -54,6 +54,11 @@ def _default_config():
             # DNS-over-TLS мимо роутера: Android в режиме «автоматически»
             # откатится на обычный DNS, если 853 отвечает отказом.
             "block_dot": True,
+            # То же для DNS-over-HTTPS к известным резолверам (8.8.8.8, 1.1.1.1…):
+            # без этого Chrome/Windows/Android уходят на DoH, сет не наполняется,
+            # и YouTube идёт напрямую. Пусто в doh_servers — встроенный список.
+            "block_doh": True,
+            "doh_servers": [],
         },
         "wan": {
             "interface": settings.DEFAULTS["wan_if"],

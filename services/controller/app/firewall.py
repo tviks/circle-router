@@ -205,6 +205,19 @@ def _forward_nat_rules(cfg):
     return "\n".join(prerouting), "\n".join(postrouting)
 
 
+# Публичные резолверы, к которым браузеры и ОС сами ходят по DoH (443/TCP,
+# 443/UDP для DoH3). Только адреса, на которых нет ничего, кроме DNS, —
+# отказ на них не ломает обычные сайты.
+DOH_SERVERS = [
+    "8.8.8.8", "8.8.4.4",                                   # Google
+    "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",  # Cloudflare
+    "9.9.9.9", "149.112.112.112", "9.9.9.11", "149.112.112.11",        # Quad9
+    "94.140.14.14", "94.140.15.15",                         # AdGuard
+    "208.67.222.222", "208.67.220.220",                     # OpenDNS
+    "77.88.8.8", "77.88.8.1",                               # Яндекс
+]
+
+
 def base_ruleset(cfg):
     """filter + nat: фаервол хоста и NAT для LAN. Не зависит от статуса VPN."""
     lan_if = cfg["lan"]["interface"]
@@ -299,6 +312,21 @@ def base_ruleset(cfg):
             "        # на обычный DNS, который мы видим.\n"
             f'        iifname "{lan_if}" tcp dport 853 reject with tcp reset\n'
         )
+    doh_rule = ""
+    if smart and smart_cfg.get("block_doh", True):
+        # То же для DNS-over-HTTPS. Chrome, Windows 11 и Android, увидев в
+        # системе 8.8.8.8 или 1.1.1.1, сами переходят на DoH к тому же адресу —
+        # и роутер перестаёт видеть DNS: адреса YouTube не попадают в сет,
+        # видео идёт напрямую под провайдерский шейпер. Отказ на 443 к
+        # известным резолверам возвращает клиента на обычный DNS. Ставится и в
+        # forward, и в input: резолверы бывают в сете прокси, и тогда TPROXY
+        # доставляет соединение локально, мимо forward.
+        servers = ", ".join(smart_cfg.get("doh_servers") or DOH_SERVERS)
+        doh_rule = (
+            f'        iifname "{lan_if}" ip daddr {{ {servers} }} tcp dport 443 '
+            "reject with tcp reset\n"
+            f'        iifname "{lan_if}" ip daddr {{ {servers} }} udp dport 443 reject\n'
+        )
 
     return f"""\
 table inet {settings.NFT_FILTER}
@@ -316,6 +344,7 @@ table inet {settings.NFT_FILTER} {{
 
         ct state established,related accept
         ct state invalid drop
+{doh_rule}\
         iif lo accept
         iifname "{lan_if}" accept
         meta l4proto {{ icmp, ipv6-icmp }} accept
@@ -332,6 +361,7 @@ table inet {settings.NFT_FILTER} {{
         ct state established,related accept
         ct state invalid drop
 {dot_rule}\
+{doh_rule}\
         # PPPoE отдаёт MTU 1492: без подгонки MSS часть сайтов виснет на
         # больших пакетах, потому что ICMP fragmentation needed режут провайдеры.
         oifname "ppp*" tcp flags syn tcp option maxseg size set rt mtu
