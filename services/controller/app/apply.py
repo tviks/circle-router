@@ -236,10 +236,19 @@ class Watchdog:
         # меняется, провайдер режет) — тоже уводим LAN напрямую, если это
         # не запрещено в настройках.
         failover = bool((cfg.get("failover") or {}).get("enabled", True))
-        tunnel_ok = not failover or tunnel.monitor.healthy()
-        want = xray_ready and tunnel_ok
         active = firewall.tproxy_active() and netctl.tproxy_routing_active(
             int(tproxy["fwmark"]), int(tproxy["table"]))
+        if not failover:
+            tunnel_ok = True
+        elif tunnel.monitor.state == "unknown":
+            # Первой пробы ещё не было (рестарт контроллера, смена сервера) —
+            # ничего не дёргаем. Иначе каждый перезапуск контроллера на десяток
+            # секунд отправлял LAN напрямую при живом туннеле. После рестарта
+            # xray TPROXY и так уже снят: он не слушал порт.
+            tunnel_ok = active
+        else:
+            tunnel_ok = tunnel.monitor.healthy()
+        want = xray_ready and tunnel_ok
 
         if want and not active:
             netctl.tproxy_routing_up(int(tproxy["fwmark"]), int(tproxy["table"]))
