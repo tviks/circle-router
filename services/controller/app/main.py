@@ -77,6 +77,7 @@ class NodeCreate(BaseModel):
     ssh_user: str = Field(default="root", max_length=64)
     password: str | None = None
     private_key: str | None = None
+    key_passphrase: str | None = None
     sni: list[str] = []
     activate: bool = True
     tune: dict | None = None
@@ -91,6 +92,7 @@ class NodeUpdate(BaseModel):
 class NodeCredentials(BaseModel):
     password: str | None = None
     private_key: str | None = None
+    key_passphrase: str | None = None
 
 
 class NodeApplyRequest(BaseModel):
@@ -497,7 +499,7 @@ def create_node(payload: NodeCreate, _: str = Depends(auth.require_user)):
         "tune": {k: v for k, v in (payload.tune or {}).items() if k in nodes.DEFAULT_TUNE},
     })
     _start_job(node["id"], "deploy", password=payload.password,
-               private_key=payload.private_key)
+               private_key=payload.private_key, key_passphrase=payload.key_passphrase)
     return {"ok": True, "node": nodes.public(node, state.load())}
 
 
@@ -534,7 +536,8 @@ def redeploy_node(node_id: str, payload: NodeCredentials,
                   _: str = Depends(auth.require_user)):
     _node_or_404(node_id)
     return {"ok": True, "job": _start_job(node_id, "deploy", password=payload.password,
-                                          private_key=payload.private_key)}
+                                          private_key=payload.private_key,
+                                          key_passphrase=payload.key_passphrase)}
 
 
 @app.post("/api/nodes/{node_id}/tune")

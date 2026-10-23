@@ -205,22 +205,23 @@ def _run(node_id, kind, kwargs):
                     job["progress"] = 1.0
 
 
-def _session(node, report, password=None, private_key=None):
+def _session(node, report, password=None, private_key=None, key_passphrase=None):
     report(f"Подключаюсь к {node['host']}:{node.get('ssh_port', 22)}")
-    session = ssh.Session(node, password=password, private_key=private_key)
+    session = ssh.Session(node, password=password, private_key=private_key,
+                          key_passphrase=key_passphrase)
     if session.learned_host_key and not node.get("host_key"):
         update(node["id"], lambda n, _: n.update({"host_key": session.learned_host_key}))
         node["host_key"] = session.learned_host_key
     return session
 
 
-def _deploy(node_id, report, password=None, private_key=None):
+def _deploy(node_id, report, password=None, private_key=None, key_passphrase=None):
     node = update(node_id, lambda n, _: n.update({"status": "deploying", "error": None}))
     report("Готовлю ключ доступа роутера", 0.01)
     pubkey = ssh.ensure_keypair(node_id)
 
     if password or private_key:
-        with _session(node, report, password, private_key) as session:
+        with _session(node, report, password, private_key, key_passphrase) as session:
             session.install_pubkey(pubkey)
         report("Ключ роутера добавлен, пароль больше не понадобится", 0.03)
     # Дальше — только по своему ключу: заодно убеждаемся, что он принят.

@@ -620,6 +620,7 @@ const EMPTY_DEPLOY = {
   auth: 'password',
   password: '',
   private_key: '',
+  key_passphrase: '',
   sni: [],
   activate: true,
   auto: true,
@@ -649,6 +650,7 @@ function DeployModal({ open, onClose, onDone }) {
         ssh_user: form.ssh_user.trim() || 'root',
         password: form.auth === 'password' ? form.password : null,
         private_key: form.auth === 'key' ? form.private_key : null,
+        key_passphrase: form.auth === 'key' ? form.key_passphrase || null : null,
         sni: form.sni,
         activate: form.activate,
         tune: { auto: form.auto, auto_apply: form.auto_apply },
@@ -737,14 +739,24 @@ function DeployModal({ open, onClose, onDone }) {
             />
           </Field>
         ) : (
-          <Field label="Приватный ключ" hint="OpenSSH или PEM без пароля; после деплоя роутер ходит своим ключом">
-            <textarea
-              className="input min-h-[110px] font-mono text-xs"
-              value={form.private_key}
-              onChange={(e) => set({ private_key: e.target.value })}
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-            />
-          </Field>
+          <>
+            <Field label="Приватный ключ" hint="OpenSSH или PEM; после деплоя роутер ходит своим ключом">
+              <textarea
+                className="input min-h-[110px] font-mono text-xs"
+                value={form.private_key}
+                onChange={(e) => set({ private_key: e.target.value })}
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              />
+            </Field>
+            <Field label="Пароль ключа" hint="если ключ им защищён; используется один раз и не сохраняется">
+              <Input
+                type="password"
+                autoComplete="off"
+                value={form.key_passphrase}
+                onChange={(e) => set({ key_passphrase: e.target.value })}
+              />
+            </Field>
+          </>
         )}
 
         <Field label="Домены маскировки Reality" hint={DEFAULT_SNI_HINT}>

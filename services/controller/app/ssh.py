@@ -57,14 +57,20 @@ def forget_keypair(node_id):
         pass
 
 
-def _load_user_key(text):
-    """Приватный ключ, вставленный в форму: OpenSSH или PEM любого типа."""
+def _load_user_key(text, passphrase=None):
+    """Приватный ключ, вставленный в форму: OpenSSH или PEM любого типа,
+    в том числе защищённый паролем."""
     for cls in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
         try:
-            return cls.from_private_key(io.StringIO(text.strip() + "\n"))
+            return cls.from_private_key(io.StringIO(text.strip() + "\n"),
+                                        password=passphrase or None)
+        except paramiko.PasswordRequiredException as exc:
+            raise SshError("ключ защищён паролем — укажите его в поле «Пароль ключа»") from exc
         except (paramiko.SSHException, ValueError):
             continue
-    raise SshError("не удалось прочитать приватный ключ (поддерживаются ed25519, ecdsa, rsa без пароля)")
+    if passphrase:
+        raise SshError("ключ не расшифровался: неверный пароль ключа или неподдерживаемый формат")
+    raise SshError("не удалось прочитать приватный ключ (поддерживаются ed25519, ecdsa, rsa)")
 
 
 class _RememberPolicy(paramiko.MissingHostKeyPolicy):
@@ -108,7 +114,8 @@ class Session:
     """Одно SSH-подключение к ноде. Команды выполняются от root: напрямую или
     через `sudo -n`, если зашли обычным пользователем."""
 
-    def __init__(self, node, password=None, private_key=None, via_proxy_port=None):
+    def __init__(self, node, password=None, private_key=None, via_proxy_port=None,
+                 key_passphrase=None):
         self.node = node
         self.client = paramiko.SSHClient()
         self.policy = _RememberPolicy()
@@ -129,7 +136,7 @@ class Session:
         if via_proxy_port:
             kwargs["sock"] = _http_connect(via_proxy_port, host, port, CONNECT_TIMEOUT)
         if private_key:
-            kwargs["pkey"] = _load_user_key(private_key)
+            kwargs["pkey"] = _load_user_key(private_key, key_passphrase)
         elif password:
             kwargs["password"] = password
         elif key_path(node["id"]).exists():
