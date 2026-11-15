@@ -15,7 +15,8 @@ log = logging.getLogger("circle.sub")
 # Панели вроде Remnawave/Marzban отдают разный формат в зависимости от
 # User-Agent: под «браузером» прилетает HTML, под клиентом — сама подписка.
 DEFAULT_UA = "v2rayNG/1.9.5"
-SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+SCHEMES = ("vless://", "vmess://", "trojan://", "ss://",
+           "wireguard://", "wg://")
 
 
 def fetch(url, user_agent=DEFAULT_UA, timeout=25):

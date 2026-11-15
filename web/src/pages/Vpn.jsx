@@ -141,7 +141,7 @@ export default function Vpn({ status, refreshStatus }) {
           <Empty
             icon={ServerCog}
             title="Серверов пока нет"
-            hint="Добавьте ссылку vless:// / vmess:// / trojan:// / ss:// или импортируйте подписку."
+            hint="Добавьте ссылку vless:// / vmess:// / trojan:// / ss:// / wireguard:// (или конфиг WireGuard) либо импортируйте подписку."
           />
         ) : (
           <ul className="divide-y divide-white/[0.06]">
@@ -409,15 +409,15 @@ function ServerModal({ server, onClose, onSaved }) {
           />
         </Field>
         <Field
-          label="Ссылка"
-          hint="vless:// · vmess:// · trojan:// · ss://"
+          label="Ссылка или конфиг WireGuard"
+          hint="vless:// · vmess:// · trojan:// · ss:// · wireguard:// · [Interface]/[Peer]"
           error={preview && !preview.ok ? preview.error : ''}
         >
           <textarea
             className="input min-h-[100px] font-mono text-xs"
             value={form.url}
             onChange={(e) => setForm({ ...form, url: e.target.value })}
-            placeholder="vless://uuid@host:443?type=tcp&security=reality&…"
+            placeholder="vless://uuid@host:443?type=tcp&security=reality&…&#10;[Interface]&#10;PrivateKey = …&#10;[Peer]&#10;Endpoint = host:51820"
           />
         </Field>
         {preview?.ok && (

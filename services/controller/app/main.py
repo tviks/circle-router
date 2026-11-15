@@ -385,8 +385,9 @@ def test_server(server_id: str, _: str = Depends(auth.require_user)):
         host, port = xray_url.endpoint(outbound)
     except Exception as exc:                           # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"не разобрал сервер: {exc}")
-    if outbound.get("protocol") == "hysteria":
-        return {"ok": False, "error": "QUIC/UDP: TCP-проба неприменима, используйте замер скорости",
+    if outbound.get("protocol") in ("hysteria", "wireguard"):
+        return {"ok": False,
+                "error": "UDP-протокол: TCP-проба неприменима, используйте замер скорости",
                 "host": host, "port": port}
 
     started = time.perf_counter()

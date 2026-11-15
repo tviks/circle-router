@@ -49,6 +49,14 @@ DEFAULT_SNI = [
 # — проверено на xray 26.3.27. Боевому профилю нужна воспроизводимость.
 FINGERPRINTS = ["chrome", "firefox", "safari"]
 
+# Внутренние адреса WireGuard-туннеля. Фиксированные: роутер и нода всегда
+# договариваются о них сами, а несколько кандидатов в подборе живут в разных
+# gVisor-стеках и друг другу не мешают.
+WG_SERVER_ADDRESS = "10.66.66.1"
+WG_CLIENT_ADDRESS = "10.66.66.2"
+WG_MTU = 1420
+WG_REMOTE_DNS = ["1.1.1.1", "1.0.0.1"]
+
 # Приватные сети на стороне сервера закрыты: иначе через туннель можно было бы
 # достучаться до сервисов самой VDS и её соседей по дата-центру.
 PRIVATE_CIDRS = [
@@ -71,6 +79,12 @@ TRANSPORTS = {
     "hy2": {"label": "Hysteria2 · QUIC", "network": "udp",
             "ports": [443, 8443], "sni": False, "tcp": False, "fixed_client": True,
             "experimental": True},
+    # WireGuard в xray-core — userspace, отдельный wg-quick на ноде не нужен.
+    # Своих ключей у него нет: в отличие от Reality, клиент и сервер просто
+    # знают пару X25519-ключей друг друга.
+    "wg": {"label": "WireGuard · UDP", "network": "udp",
+           "ports": [51820, 2408, 8443], "sni": False, "tcp": False,
+           "fixed_client": True, "experimental": True},
 }
 
 FRAGMENT = {"packets": "tlshello", "length": "100-200", "interval": "10-20"}
@@ -102,6 +116,33 @@ def _self_signed(name):
     return cert_pem, key_pem, digest
 
 
+def _wg_keypair():
+    """Пара ключей WireGuard: base64 X25519 (стандартный алфавит, не urlsafe)."""
+    private = X25519PrivateKey.generate()
+    raw_priv = private.private_bytes(serialization.Encoding.Raw,
+                                     serialization.PrivateFormat.Raw,
+                                     serialization.NoEncryption())
+    raw_pub = private.public_key().public_bytes(serialization.Encoding.Raw,
+                                                serialization.PublicFormat.Raw)
+    return (base64.b64encode(raw_priv).decode(),
+            base64.b64encode(raw_pub).decode())
+
+
+def ensure_wg_secrets(secrets):
+    """Дописывает ключи WireGuard в ноду, созданную до их появления.
+
+    Возвращает True, если что-то добавилось: вызывающий сохраняет конфиг.
+    """
+    changed = False
+    if not secrets.get("wg_private") or not secrets.get("wg_public"):
+        secrets["wg_private"], secrets["wg_public"] = _wg_keypair()
+        changed = True
+    if not secrets.get("wg_client_private") or not secrets.get("wg_client_public"):
+        secrets["wg_client_private"], secrets["wg_client_public"] = _wg_keypair()
+        changed = True
+    return changed
+
+
 def new_secrets():
     private = X25519PrivateKey.generate()
     raw_priv = private.private_bytes(serialization.Encoding.Raw,
@@ -111,6 +152,8 @@ def new_secrets():
                                                 serialization.PublicFormat.Raw)
     hy2_name = DEFAULT_SNI[0]
     cert_pem, key_pem, digest = _self_signed(hy2_name)
+    wg_private, wg_public = _wg_keypair()
+    wg_client_private, wg_client_public = _wg_keypair()
     return {
         "uuid": str(uuid.uuid4()),
         "reality_private": _b64url(raw_priv),
@@ -126,6 +169,10 @@ def new_secrets():
         "hy2_cert": cert_pem,
         "hy2_key": key_pem,
         "hy2_cert_sha256": digest,
+        "wg_private": wg_private,
+        "wg_public": wg_public,
+        "wg_client_private": wg_client_private,
+        "wg_client_public": wg_client_public,
     }
 
 
@@ -232,6 +279,20 @@ def server_inbound(node, c, tag):
                 "hysteriaSettings": {"version": 2},
             },
         }
+    if t == "wg":
+        return {
+            "tag": tag, "port": port, "protocol": "wireguard",
+            "settings": {
+                "secretKey": s["wg_private"],
+                "address": [WG_SERVER_ADDRESS],
+                "peers": [{
+                    "publicKey": s["wg_client_public"],
+                    "allowedIPs": [f"{WG_CLIENT_ADDRESS}/32"],
+                    "email": "router",
+                }],
+                "mtu": WG_MTU,
+            },
+        }
     raise ValueError(f"неизвестный транспорт {t}")
 
 
@@ -287,7 +348,9 @@ def client_outbounds(node, c, tag="proxy"):
         user = {"id": s["uuid"], "encryption": "none"}
         stream = {"security": "reality", "realitySettings": _client_reality(node, c)}
         if t == "vision":
-            user["flow"] = "xtls-rprx-vision"
+            # -udp443: сервер по-прежнему видит обычный Vision, но клиент не
+            # отбрасывает QUIC. Иначе UDP/443 не проходит через туннель.
+            user["flow"] = "xtls-rprx-vision-udp443"
             stream["network"] = "tcp"
         elif t == "xhttp":
             stream["network"] = "xhttp"
@@ -311,6 +374,23 @@ def client_outbounds(node, c, tag="proxy"):
                         "tlsSettings": {"serverName": s["hy2_sni"], "alpn": ["h3"],
                                         "pinnedPeerCertSha256": s["hy2_cert_sha256"]},
                         "hysteriaSettings": {"version": 2, "auth": s["hy2_auth"]},
+                    }}
+    elif t == "wg":
+        endpoint = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        outbound = {"tag": tag, "protocol": "wireguard",
+                    "settings": {
+                        "secretKey": s["wg_client_private"],
+                        "address": [WG_CLIENT_ADDRESS],
+                        "peers": [{
+                            "endpoint": endpoint,
+                            "publicKey": s["wg_public"],
+                            "keepAlive": 25,
+                            "allowedIPs": ["0.0.0.0/0", "::/0"],
+                        }],
+                        # Контейнер без /dev/net/tun — только gVisor-стек.
+                        "noKernelTun": True,
+                        "mtu": WG_MTU,
+                        "remoteDNS": list(WG_REMOTE_DNS),
                     }}
     else:
         raise ValueError(f"неизвестный транспорт {t}")

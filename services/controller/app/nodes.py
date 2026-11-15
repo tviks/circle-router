@@ -205,6 +205,13 @@ def _run(node_id, kind, kwargs):
                     job["progress"] = 1.0
 
 
+def _ensure_wg(node):
+    """Досоздаёт ключи WireGuard у нод, появившихся до этой поддержки."""
+    def fill(n, _cfg):
+        nb.ensure_wg_secrets(n.setdefault("secrets", {}))
+    return update(node["id"], fill)
+
+
 def _session(node, report, password=None, private_key=None, key_passphrase=None):
     report(f"Подключаюсь к {node['host']}:{node.get('ssh_port', 22)}")
     session = ssh.Session(node, password=password, private_key=private_key,
@@ -247,6 +254,7 @@ def _tune(node_id, report, reason="вручную"):
 
 
 def _tune_and_settle(node, session, report, initial, reason="первый деплой"):
+    node = _ensure_wg(node)
     tune_cfg = {**DEFAULT_TUNE, **(node.get("tune") or {})}
     production = None if initial else node.get("profile")
     sni = [s for s in node.get("sni") or [] if s] or nb.DEFAULT_SNI
@@ -324,6 +332,7 @@ def _recommend(result, production, tune_cfg):
 
 def _settle(node, session, cand, report):
     """Сделать кандидата боевым: конфиг на ноде, сервер в списке роутера."""
+    node = _ensure_wg(node)
     spec = {k: cand[k] for k in ("transport", "port", "sni") if k in cand}
     old = node.get("profile")
     new_port = (nb.network_of(cand), int(cand["port"]))

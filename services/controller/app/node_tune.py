@@ -388,7 +388,7 @@ class Tuner:
         # A. транспорты
         self.report("Раунд A: какие транспорты проходят через аплинк", 0.15)
         specs_a = layout([("vision", sni1), ("xhttp", sni1), ("grpc", sni1),
-                          ("ss2022", None), ("hy2", None)])
+                          ("ss2022", None), ("hy2", None), ("wg", None)])
         self._probe_round(specs_a, [client(s) for s in specs_a], "A")
 
         # B. домены
@@ -404,7 +404,8 @@ class Tuner:
             cand = self._best(lambda c, t=transport: c["transport"] == t)
             best_sni[transport] = cand["sni"] if cand else sni1
         final_layout = layout([("vision", best_sni["vision"]), ("xhttp", best_sni["xhttp"]),
-                               ("grpc", best_sni["grpc"]), ("ss2022", None), ("hy2", None)])
+                               ("grpc", best_sni["grpc"]), ("ss2022", None),
+                               ("hy2", None), ("wg", None)])
         variants = []
         for s in final_layout:
             if nb.TRANSPORTS[s["transport"]].get("fixed_client"):
