@@ -73,9 +73,10 @@ def routing_rules(cfg, vpn_enabled):
         rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
         return rules
 
-    # Собственные запросы резолвера xray — строго через VPN. Иначе они
-    # попадают под правило «UDP напрямую», а провайдер подменяет ответы даже
-    # от 8.8.8.8: на заблокированные домены прилетает NXDOMAIN.
+    # Собственные запросы резолвера xray — строго через VPN, мимо правил
+    # обхода. Иначе при bypass/failover они уйдут напрямую, а провайдер
+    # подменяет ответы даже от 8.8.8.8: на заблокированные домены прилетает
+    # NXDOMAIN.
     if _dns_failover(cfg):
         # …но если туннель умер, резолвер не должен умереть вместе с ним:
         # балансировщик с одним участником и запасным direct. Иначе в обходе
@@ -92,13 +93,17 @@ def routing_rules(cfg, vpn_enabled):
     rules.append({"type": "field", "inboundTag": ["tproxy-in"], "port": "53",
                   "outboundTag": "dns-out"})
 
-    if cfg.get("block_quic", True):
-        # VLESS поверх TCP не тянет UDP без xudp, поэтому QUIC режем — браузеры
-        # быстро откатываются на TCP, и он уже идёт через VPN.
+    if cfg.get("block_quic"):
+        # Необязательный обход: часть провайдеров и серверов плохо переносит
+        # UDP/443. По умолчанию QUIC идёт в туннель вместе с остальным UDP.
         rules.append({"type": "field", "network": "udp", "port": "443",
                       "outboundTag": "block"})
-    # Остальной UDP (NTP, игры, discovery) пускаем напрямую через NAT.
-    rules.append({"type": "field", "network": "udp", "outboundTag": "direct"})
+
+    # Отдельного правила «UDP напрямую» здесь больше нет: UDP идёт тем же
+    # путём, что и TCP, и решается правилами ниже. VLESS/VMess/Trojan несут
+    # его через XUDP поверх TCP, Shadowsocks, Hysteria2 и WireGuard — нативно.
+    # Раньше весь UDP уходил в direct: QUIC, игры, голосовые звонки и
+    # WireGuard-клиенты оставались без VPN, хотя TPROXY их уже перехватывал.
 
     # Свои же подсети и служебные адреса — всегда мимо прокси.
     rules.append({

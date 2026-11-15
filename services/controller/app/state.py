@@ -18,7 +18,7 @@ def _default_config():
     )
     hosts = list(lan_net.hosts())
     return {
-        "version": 1,
+        "version": 2,
         "vpn_enabled": False,
         "servers": [],
         "active_server": None,
@@ -159,7 +159,9 @@ def _default_config():
         },
         # Свои VDS-ноды, развёрнутые из панели (см. nodes.py).
         "nodes": [],
-        "block_quic": True,
+        # Оставлено для провайдеров, которые давят UDP/443: по умолчанию
+        # QUIC идёт в VPN, как и остальной UDP.
+        "block_quic": False,
         "log_level": "warning",
     }
 
@@ -174,8 +176,33 @@ def _deep_fill(target, template):
     return target
 
 
+def _migrate(cfg):
+    """Переводит старый router.json на текущие умолчания.
+
+    Миграций как таковых нет — только то, что нельзя выразить новым ключом.
+    До версии 2 весь UDP уходил напрямую, а QUIC/443 блокировался; теперь UDP
+    идёт через VPN. Старый `block_quic: true` иначе продолжал бы резать QUIC
+    и после обновления, хотя галки для него в панели нет.
+    """
+    try:
+        version = int(cfg.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version < 2:
+        cfg["block_quic"] = False
+        cfg["version"] = 2
+    return cfg
+
+
 def new_id():
     return uuid.uuid4().hex[:12]
+
+
+def normalize(cfg):
+    """Приводит сторонний словарь (файл, бэкап) к текущей схеме:
+    дописывает недостающие ключи из умолчаний и гонит миграции."""
+    _deep_fill(cfg, _default_config())
+    return _migrate(cfg)
 
 
 def load():
@@ -190,8 +217,7 @@ def load():
             cfg = {}
         if not isinstance(cfg, dict):
             cfg = {}
-        cfg = _deep_fill(cfg, _default_config())
-        return cfg
+        return normalize(cfg)
 
 
 def _write(cfg):
