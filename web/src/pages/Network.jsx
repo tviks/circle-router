@@ -21,6 +21,10 @@ const WAN_MODES = [
   ['static', 'Статический адрес'],
 ]
 
+// Имя моста, который контроллер собирает из LAN-порта и свич-портов
+// (см. netctl.LAN_BRIDGE). Дублируем константу: фронт не ходит в Python.
+const LAN_BRIDGE = 'br-lan'
+
 export default function Network({ status, refreshStatus }) {
   const toast = useToast()
   const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
@@ -71,7 +75,30 @@ export default function Network({ status, refreshStatus }) {
     }
   }
 
-  const ifaceOptions = (interfaces ?? []).map((i) => i.name)
+  // br-lan из выбора портов исключён: это наш мост, он создаётся сам.
+  const ifaceOptions = (interfaces ?? []).map((i) => i.name).filter((n) => n !== LAN_BRIDGE)
+
+  // Режим свича имеет смысл только на платах с тремя и более ethernet:
+  // свободные порты (не WAN, не LAN, не наш мост и не ppp-сессии) можно
+  // включить в LAN. Порты из конфига, которых сейчас нет в системе (выдернутый
+  // USB-адаптер), тоже показываем — иначе их нельзя было бы выключить.
+  const switchPorts = draft.lan.switch_ports ?? []
+  const knownNames = new Set((interfaces ?? []).map((i) => i.name))
+  const switchCandidates = [
+    ...(interfaces ?? []),
+    ...switchPorts
+      .filter((p) => !knownNames.has(p))
+      .map((name) => ({ name, carrier: false })),
+  ].filter(
+    (i) =>
+      i.name !== draft.wan.interface &&
+      i.name !== draft.lan.interface &&
+      i.name !== LAN_BRIDGE &&
+      !/^ppp/.test(i.name)
+  )
+  const lanDevice = switchPorts.length ? LAN_BRIDGE : draft.lan.interface
+  const toggleSwitchPort = (name, on) =>
+    set('lan.switch_ports', on ? [...switchPorts, name] : switchPorts.filter((p) => p !== name))
 
   return (
     <div className="space-y-5">
@@ -109,7 +136,11 @@ export default function Network({ status, refreshStatus }) {
               </span>
               <span className="mono ml-auto text-xs text-slate-700">{iface.mac}</span>
               {iface.name === draft.wan.interface && <Chip tone="info">WAN</Chip>}
+              {iface.name === LAN_BRIDGE && switchPorts.length > 0 && (
+                <Chip tone="ok">LAN (мост)</Chip>
+              )}
               {iface.name === draft.lan.interface && <Chip tone="ok">LAN</Chip>}
+              {switchPorts.includes(iface.name) && <Chip tone="ok">свич</Chip>}
             </li>
           ))}
         </ul>
@@ -255,6 +286,31 @@ export default function Network({ status, refreshStatus }) {
                 ))}
               </Select>
             </Field>
+
+            {switchCandidates.length > 0 && (
+              <div className="space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
+                <p className="text-xs text-slate-500">
+                  Свободные порты можно включить в LAN как свич: воткнутое в них
+                  устройство окажется в той же сети и получит адрес по DHCP.
+                </p>
+                {switchCandidates.map((iface) => (
+                  <Toggle
+                    key={iface.name}
+                    checked={switchPorts.includes(iface.name)}
+                    onChange={(v) => toggleSwitchPort(iface.name, v)}
+                    label={iface.name}
+                    description={iface.carrier ? 'кабель подключён' : 'нет кабеля'}
+                  />
+                ))}
+                {switchPorts.length > 0 && (
+                  <p className="text-xs text-amber-200/80">
+                    При сохранении адрес LAN переедет на мост{' '}
+                    <span className="mono">{LAN_BRIDGE}</span> — связь на пару секунд
+                    прервётся, DHCP и правила фаервола продолжат работать как раньше.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Адрес роутера">
                 <Input

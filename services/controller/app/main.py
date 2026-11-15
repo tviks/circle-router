@@ -196,12 +196,19 @@ def status(_: str = Depends(auth.require_user)):
         "wan": _wan_snapshot(cfg),
         "lan": {
             "interface": cfg["lan"]["interface"],
+            # device — бридж, когда свич-порты включены: на нём адрес и dnsmasq.
+            "device": netctl.lan_device(cfg),
+            "switch_ports": list(cfg["lan"].get("switch_ports") or []),
+            "members": netctl.lan_members(cfg),
+            "bridge_members": netctl.bridge_members(),
             "address": cfg["lan"]["address"],
             "prefix": cfg["lan"]["prefix"],
             "network": str(state.lan_network(cfg)),
-            "link": netctl.link_state(cfg["lan"]["interface"]),
-            "carrier": netctl.has_carrier(cfg["lan"]["interface"]),
-            "addresses": netctl.iface_addresses(cfg["lan"]["interface"]),
+            "link": netctl.link_state(netctl.lan_device(cfg)),
+            # У бриджа нет собственного «кабеля»: считаемся живым, если линк
+            # есть хотя бы на одном порту-члене.
+            "carrier": any(netctl.has_carrier(p) for p in netctl.lan_members(cfg)),
+            "addresses": netctl.iface_addresses(netctl.lan_device(cfg)),
         },
         "dhcp": {"enabled": cfg["dhcp"].get("enabled", True),
                  "leases": len(dnsmasq_cfg.leases())},
@@ -269,7 +276,8 @@ def post_config(patch: dict, _: str = Depends(auth.require_user)):
         _merge(cfg, patch)
 
     cfg = state.update(mutate)
-    problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg)
+    problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg) \
+        + netctl.validate_lan(cfg)
     return {"ok": not problems, "problems": problems, "config": get_config()}
 
 

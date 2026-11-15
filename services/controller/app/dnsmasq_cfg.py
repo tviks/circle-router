@@ -5,7 +5,7 @@ import logging
 import os
 import time
 
-from . import proxylists, settings, state, xray_build
+from . import netctl, proxylists, settings, state, xray_build
 
 log = logging.getLogger("circle.dnsmasq")
 
@@ -19,7 +19,8 @@ def render(cfg):
 
     lines = [
         "# Сгенерировано circle-router. Правки руками перезапишутся.",
-        f"interface={lan['interface']}",
+        # Слушаем LAN-девайс: физический порт или бридж, если включён свич.
+        f"interface={netctl.lan_device(cfg)}",
         f"listen-address={router_ip}",
         "bind-interfaces",
         f"except-interface={cfg['wan']['interface']}",

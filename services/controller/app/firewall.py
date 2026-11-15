@@ -172,7 +172,7 @@ def validate_forwards(cfg):
 def _forward_nat_rules(cfg):
     """DNAT снаружи + hairpin изнутри для проброшенных портов."""
     wan_if = cfg["wan"]["interface"]
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     lan_ip = cfg["lan"]["address"]
     lan_net = str(state.lan_network(cfg))
     prerouting, postrouting = [], []
@@ -220,7 +220,7 @@ DOH_SERVERS = [
 
 def base_ruleset(cfg):
     """filter + nat: фаервол хоста и NAT для LAN. Не зависит от статуса VPN."""
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     wan_if = cfg["wan"]["interface"]
     egress_pattern = state.wan_egress_pattern(cfg)
     lan_net = str(state.lan_network(cfg))
@@ -435,7 +435,7 @@ def tproxy_ruleset(cfg, enabled):
         # Пустая цепочка = TPROXY выключен (tproxy_active смотрит на её правила).
         return "\n".join(script) + "\n"
 
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     port = int(cfg["tproxy"]["port"])
     mark = int(cfg["tproxy"]["fwmark"])
     chain = f"add rule {table} prerouting"
@@ -483,7 +483,7 @@ def acct_ruleset(cfg):
     пакетах. Заодно учитывается трафик, завёрнутый в xray, — он вообще не
     транзитный и в forward не попадал никогда.
     """
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     lan_net = str(state.lan_network(cfg))
     return f"""\
 table inet {settings.NFT_ACCT}
@@ -541,7 +541,7 @@ DOCKER_RULE_COMMENT = "circle-router"
 
 
 def docker_user_rules(cfg):
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     wan_if = cfg["wan"]["interface"]
     uplink = cfg.get("uplink_access") or {}
     wan_set = f'{{ "{wan_if}", "ppp*" }}'
@@ -616,7 +616,7 @@ def apply_accounting(cfg, force=False):
     """Пересоздаём таблицу учёта только при нужде — иначе обнулим счётчики."""
     if not force and table_exists(ACCT_FAMILY, settings.NFT_ACCT):
         chain = out(["nft", "list", "chain", ACCT_FAMILY, settings.NFT_ACCT, "accounting"])
-        if f'"{cfg["lan"]["interface"]}"' in chain:
+        if f'"{netctl.lan_device(cfg)}"' in chain:
             return False
     _nft(acct_ruleset(cfg))
     return True

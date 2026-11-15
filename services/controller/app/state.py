@@ -77,6 +77,9 @@ def _default_config():
             "interface": settings.DEFAULTS["lan_if"],
             "address": settings.DEFAULTS["lan_address"],
             "prefix": settings.DEFAULTS["lan_prefix"],
+            # Свободные порты плат с тремя и более ethernet: включённые сюда
+            # собираются в бридж с LAN-портом и работают как свич (см. netctl).
+            "switch_ports": [],
         },
         "dhcp": {
             "enabled": True,

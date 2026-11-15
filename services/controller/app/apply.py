@@ -48,17 +48,25 @@ def reconcile(restart_services=True):
         dhcp_problems = dnsmasq_cfg.validate(cfg)
         errors.extend(dhcp_problems)
         errors.extend(firewall.validate_forwards(cfg))
+        errors.extend(netctl.validate_lan(cfg))
 
-        sysctls = netctl.prepare_host(cfg["lan"]["interface"], cfg["wan"]["interface"])
+        members = netctl.lan_members(cfg)
+        netctl.mark_unmanaged(members)
+        # Бридж собираем до sysctl: rp_filter выставляется и бриджу, а его
+        # путь в /proc/sys появляется только вместе с девайсом.
+        device = netctl.apply_bridge(cfg)
+        sysctls = netctl.prepare_host(device, cfg["wan"]["interface"], lan_ports=members)
         failed = [k for k, ok in sysctls.items() if not ok]
         if failed:
             errors.append("не удалось выставить sysctl: " + ", ".join(failed))
         steps.append("sysctl и модули ядра")
 
-        netctl.mark_unmanaged(cfg["lan"]["interface"])
-        address = netctl.configure_lan(cfg["lan"]["interface"], cfg["lan"]["address"],
+        address = netctl.configure_lan(device, cfg["lan"]["address"],
                                        cfg["lan"]["prefix"])
-        steps.append(f"LAN {cfg['lan']['interface']} -> {address}")
+        # Адрес мог остаться на физическом порту после перехода в свич (или
+        # наоборот, после отказа от свича в бридже) — сгоняем, иначе ARP flux.
+        netctl.prune_member_addresses(members, state.lan_network(cfg), keep=device)
+        steps.append(f"LAN {device} -> {address}")
 
         mode = cfg["wan"].get("mode", "dhcp")
         if mode == "pppoe":
@@ -265,11 +273,17 @@ class Watchdog:
             self._note("failover", "туннель ещё не ответил — клиенты идут напрямую")
 
         # LAN-адрес мог снести networkd при событии на линке — возвращаем.
+        # В режиме свича адрес живёт на бридже; заодно доклеиваем порты,
+        # выпавшие из него (networkd и пересборка netplan'а любят это делать).
         lan = cfg["lan"]
+        device = netctl.lan_device(cfg)
+        if device == netctl.LAN_BRIDGE and not netctl.bridge_ok(cfg):
+            netctl.apply_bridge(cfg)
+            log.info("пересобрал бридж %s", device)
         wanted = f"{lan['address']}/{lan['prefix']}"
-        if wanted not in netctl.iface_addresses(lan["interface"]):
-            netctl.configure_lan(lan["interface"], lan["address"], lan["prefix"])
-            log.info("вернул адрес %s на %s", wanted, lan["interface"])
+        if wanted not in netctl.iface_addresses(device):
+            netctl.configure_lan(device, lan["address"], lan["prefix"])
+            log.info("вернул адрес %s на %s", wanted, device)
 
         # Перезапуск демона Docker пересоздаёт свои цепочки и вычищает наши
         # правила из DOCKER-USER — без них транзит мимо прокси снова умрёт.

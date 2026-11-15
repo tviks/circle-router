@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import db, firewall, settings, state, sysinfo
+from . import db, firewall, netctl, settings, state, sysinfo
 from .shell import out
 
 log = logging.getLogger("circle.stats")
@@ -100,7 +100,9 @@ class Sampler:
 
     def _sample(self, tick):
         cfg = state.load()
-        lan_if = cfg["lan"]["interface"]
+        # Счётчики бриджа видят только маршрутизируемый (L3) трафик; чистый
+        # LAN-клиент↔клиент он не считает — но его не считал и физический порт.
+        lan_if = netctl.lan_device(cfg)
         wan_if = state.wan_interface(cfg)
         now = time.time()
 
