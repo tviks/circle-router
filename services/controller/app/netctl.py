@@ -208,6 +208,18 @@ def enable_rps(iface):
         return False
 
 
+def _sysfs_value(name, key):
+    """Сырое значение из /sys/class/net/<name>/<key> или None.
+
+    speed/duplex драйвер отдаёт только при поднятом линке: без кабеля чтение
+    кидает EINVAL — это обычная ситуация, а не ошибка.
+    """
+    try:
+        return (Path("/sys/class/net") / name / key).read_text().strip()
+    except OSError:
+        return None
+
+
 def interfaces():
     """Список физических интерфейсов хоста с состоянием и адресами."""
     try:
@@ -227,6 +239,7 @@ def interfaces():
             for a in link.get("addr_info", [])
             if a.get("family") == "inet"
         ]
+        speed = _sysfs_value(name, "speed")
         result.append({
             "name": name,
             "mac": link.get("address", ""),
@@ -234,6 +247,9 @@ def interfaces():
             "carrier": has_carrier(name),
             "mtu": link.get("mtu"),
             "addresses": addrs,
+            # Согласованная линком скорость, Мбит/с, и дуплекс.
+            "speed": int(speed) if speed and speed.isdigit() and int(speed) > 0 else None,
+            "duplex": _sysfs_value(name, "duplex") or None,
         })
     return sorted(result, key=lambda i: i["name"])
 
