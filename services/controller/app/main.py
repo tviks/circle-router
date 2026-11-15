@@ -29,7 +29,7 @@ app = FastAPI(title="circle-router", docs_url=None, redoc_url=None)
 # Ключи конфига, которые панель имеет право менять.
 EDITABLE = {"vpn_enabled", "bypass", "force_proxy", "wan", "lan", "dhcp", "dns",
             "tproxy", "firewall", "uplink_access", "port_forward", "adblock",
-            "speedtest", "block_quic", "log_level", "failover"}
+            "speedtest", "block_quic", "bypass_torrents", "log_level", "failover"}
 
 
 # ── схемы запросов ───────────────────────────────────────────────────────────

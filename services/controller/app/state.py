@@ -162,6 +162,9 @@ def _default_config():
         # Оставлено для провайдеров, которые давят UDP/443: по умолчанию
         # QUIC идёт в VPN, как и остальной UDP.
         "block_quic": False,
+        # Торренты — в direct: сниффер bittorrent в xray опознаёт DHT/uTP,
+        # и правило маршрутизации уводит их из туннеля (см. xray_build).
+        "bypass_torrents": True,
         "log_level": "warning",
     }
 

@@ -99,6 +99,16 @@ def routing_rules(cfg, vpn_enabled):
         rules.append({"type": "field", "network": "udp", "port": "443",
                       "outboundTag": "block"})
 
+    if cfg.get("bypass_torrents"):
+        # Торренты — мимо VPN: сниффер bittorrent на tproxy-in (routeOnly)
+        # опознаёт DHT и uTP по содержимому, а не по портам. Стоит до
+        # force_proxy, иначе раздача к заблокированному трекеру утащила бы
+        # за собой и весь пиринговый трафик. В умном прокси правило почти
+        # не работает: пир-адреса в nft-сет proxy_dst не попадают и до xray
+        # не доезжают — там ядро и так гоняет их напрямую.
+        rules.append({"type": "field", "inboundTag": ["tproxy-in"],
+                      "protocol": ["bittorrent"], "outboundTag": "direct"})
+
     # Отдельного правила «UDP напрямую» здесь больше нет: UDP идёт тем же
     # путём, что и TCP, и решается правилами ниже. VLESS/VMess/Trojan несут
     # его через XUDP поверх TCP, Shadowsocks, Hysteria2 и WireGuard — нативно.

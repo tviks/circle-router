@@ -516,7 +516,11 @@ function RoutingRules() {
   const save = useCallback(async () => {
     setBusy(true)
     try {
-      await api.patchConfig({ bypass: draft.bypass, force_proxy: draft.force_proxy })
+      await api.patchConfig({
+        bypass: draft.bypass,
+        force_proxy: draft.force_proxy,
+        bypass_torrents: Boolean(draft.bypass_torrents),
+      })
       await api.apply()
       toast('Правила маршрутизации применены', 'ok')
       await settle()
@@ -555,6 +559,15 @@ function RoutingRules() {
           <option key={c} value={c} />
         ))}
       </datalist>
+
+      <div className="mb-6 border-b border-white/[0.06] pb-6">
+        <Toggle
+          checked={Boolean(draft.bypass_torrents)}
+          onChange={(v) => edit((d) => ({ ...d, bypass_torrents: v }))}
+          label="Торренты мимо VPN"
+          description="xray опознаёт DHT и uTP по содержимому, а не по портам — раздачи идут напрямую, остальное как обычно"
+        />
+      </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
         <div className="space-y-4">
