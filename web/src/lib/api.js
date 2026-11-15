@@ -46,6 +46,22 @@ export const api = {
   patchConfig: (patch) => request('/config', { method: 'POST', body: patch }),
   apply: () => request('/apply', { method: 'POST' }),
 
+  // Бэкап — файл с секретами, поэтому качаем через fetch с cookie сессии,
+  // а не прямой ссылкой: <a href> не пройдёт авторизацию.
+  backup: async () => {
+    const response = await fetch(BASE + '/backup', { credentials: 'same-origin' })
+    if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status)
+    const disposition = response.headers.get('Content-Disposition') || ''
+    const match = disposition.match(/filename="([^"]+)"/)
+    const url = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = url
+    link.download = match?.[1] || 'circle-router-backup.json'
+    link.click()
+    URL.revokeObjectURL(url)
+  },
+  restore: (payload) => request('/restore', { method: 'POST', body: payload }),
+
   servers: () => request('/servers'),
   addServer: (server) => request('/servers', { method: 'POST', body: server }),
   editServer: (id, server) => request(`/servers/${id}`, { method: 'PUT', body: server }),

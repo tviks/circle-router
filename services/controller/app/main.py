@@ -1,5 +1,6 @@
 """REST API и раздача веб-панели circle-router."""
 
+import json
 import logging
 import os
 import socket
@@ -283,6 +284,57 @@ def post_config(patch: dict, _: str = Depends(auth.require_user)):
 
 @app.post("/api/apply")
 def post_apply(_: str = Depends(auth.require_user)):
+    result = apply.reconcile()
+    if not result.get("ok"):
+        return JSONResponse(status_code=422, content=result)
+    return result
+
+
+# ── резервная копия конфигурации ─────────────────────────────────────────────
+# router.json — единственный источник правды: dnsmasq.conf, xray-конфиг и
+# nftables генерируются из него при каждом «Применить». Поэтому бэкап — это
+# сам router.json целиком, включая секреты (пароль PPPoE, ключи нод, ссылки
+# серверов), которые GET /api/config вырезает. Файл равнозначен паролю панели.
+
+BACKUP_KIND = "circle-router-backup"
+
+
+@app.get("/api/backup")
+def get_backup(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    payload = {
+        "kind": BACKUP_KIND,
+        "version": cfg.get("version"),
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "config": cfg,
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    filename = f"circle-router-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/restore")
+def post_restore(payload: dict, _: str = Depends(auth.require_user)):
+    if payload.get("kind") != BACKUP_KIND or not isinstance(payload.get("config"), dict):
+        return {"ok": False, "problems": ["это не файл резервной копии circle-router"]}
+
+    # Конфиг мог быть снят со старой версии — дописываем ключи, которых ещё
+    # не было, и прогоняем миграции, как при обычном чтении.
+    restored = state.normalize(payload["config"])
+    problems = dnsmasq_cfg.validate(restored) + firewall.validate_forwards(restored) \
+        + netctl.validate_lan(restored)
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    def mutate(cfg):
+        cfg.clear()
+        cfg.update(restored)
+
+    state.update(mutate)
     result = apply.reconcile()
     if not result.get("ok"):
         return JSONResponse(status_code=422, content=result)

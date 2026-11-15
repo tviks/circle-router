@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Database, KeyRound, RotateCw, ScrollText } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Database, Download, KeyRound, RotateCw, ScrollText, Upload } from 'lucide-react'
 
 import { api } from '../lib/api'
 import { usePoll } from '../lib/hooks'
 import { dateLabel } from '../lib/format'
-import { Card, Chip, Field, Input, Spinner, useToast } from '../components/ui'
+import { Card, Chip, Field, Input, Modal, Spinner, useToast } from '../components/ui'
 
 const SERVICES = [
   ['xray', 'xray-core'],
@@ -93,6 +93,8 @@ export default function System({ status, refreshStatus }) {
       </div>
 
       <PasswordCard />
+
+      <BackupCard refreshStatus={refreshStatus} />
 
       {lastApply?.ts > 0 && (
         <Card
@@ -222,6 +224,107 @@ function PasswordCard() {
     </Card>
   )
 }
+
+function BackupCard({ refreshStatus }) {
+  const toast = useToast()
+  const fileInput = useRef(null)
+  const [busy, setBusy] = useState('')
+  // {payload, name} выбранного файла — показываем в модалке до подтверждения.
+  const [pending, setPending] = useState(null)
+
+  const download = async () => {
+    setBusy('save')
+    try {
+      await api.backup()
+      toast('Резервная копия скачана', 'ok')
+    } catch (err) {
+      toast(err.message, 'bad', 9000)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const pickFile = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = '' // чтобы повторный выбор того же файла тоже вызвал onChange
+    if (!file) return
+    try {
+      const payload = JSON.parse(await file.text())
+      if (payload?.kind !== 'circle-router-backup') {
+        toast('Это не файл резервной копии circle-router', 'bad')
+        return
+      }
+      setPending({ payload, name: file.name })
+    } catch {
+      toast('Файл не читается как JSON', 'bad')
+    }
+  }
+
+  const restore = async () => {
+    setBusy('restore')
+    try {
+      const result = await api.restore(pending.payload)
+      if (result?.ok === false) {
+        toast(`Не восстановлено: ${result.problems?.join('; ')}`, 'bad', 12000)
+      } else {
+        toast('Конфигурация восстановлена и применена', 'ok', 8000)
+        setPending(null)
+        await refreshStatus?.()
+      }
+    } catch (err) {
+      toast(`Восстановление не удалось: ${err.message}`, 'bad', 12000)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  return (
+    <Card
+      title="Резервная копия"
+      subtitle="весь router.json: серверы, ноды, сеть — но не пароль панели"
+    >
+      <p className="text-sm text-slate-400">
+        В файле — секреты серверов и нод, храните его как пароль. Восстановление
+        полностью заменяет текущую конфигурацию и сразу применяет её.
+      </p>
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <button className="btn-primary" onClick={download} disabled={busy === 'save'}>
+          {busy === 'save' ? <Spinner /> : <Download size={15} />} Скачать
+        </button>
+        <button className="btn-ghost" onClick={() => fileInput.current?.click()} disabled={busy === 'restore'}>
+          {busy === 'restore' ? <Spinner /> : <Upload size={15} />} Восстановить из файла
+        </button>
+        <input ref={fileInput} type="file" accept=".json,application/json" className="hidden" onChange={pickFile} />
+      </div>
+
+      <Modal
+        open={Boolean(pending)}
+        title="Восстановить конфигурацию?"
+        onClose={() => (busy ? null : setPending(null))}
+        footer={
+          <>
+            <button className="btn-ghost" onClick={() => setPending(null)} disabled={busy}>
+              Отмена
+            </button>
+            <button className="btn-primary" onClick={restore} disabled={busy}>
+              {busy && <Spinner />} Восстановить и применить
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-300">
+          Файл <span className="mono">{pending?.name}</span>
+          {pending?.payload?.created && <> от {dateLabel(Date.parse(pending.payload.created) / 1000)}</>}.
+        </p>
+        <p className="mt-2 text-sm text-rose-300">
+          Текущая конфигурация, включая серверы VPN и настройки сети, будет полностью
+          заменена и сразу применена.
+        </p>
+      </Modal>
+    </Card>
+  )
+}
+
 
 function LogView({ text }) {
   const [pinned, setPinned] = useState(true)
