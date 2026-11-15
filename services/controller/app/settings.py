@@ -52,6 +52,11 @@ NFT_NAT = "circle_nat"
 NFT_MANGLE = "circle_mangle"
 NFT_ACCT = "circle_acct"
 
+# sockopt.mark аутбаундов xray при self_vpn: пакеты самого xray не должны
+# попадать под ip rule fwmark (tproxy.fwmark) и снова заворачиваться в
+# tproxy-инбаунд — в nft output-цепочке этот mark возвращает из цепочки.
+XRAY_MARK = 0xFF
+
 DEFAULTS = {
     "wan_if": os.environ.get("CR_WAN_IF", "enp2s0"),
     "lan_if": os.environ.get("CR_LAN_IF", "enp1s0"),

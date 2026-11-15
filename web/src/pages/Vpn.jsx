@@ -169,7 +169,7 @@ export default function Vpn({ status, refreshStatus }) {
 
       <FailoverCard status={status} />
 
-      <RoutingRules />
+      <RoutingRules status={status} refreshStatus={refreshStatus} />
 
       <ServerModal
         server={editing}
@@ -504,7 +504,7 @@ function ImportModal({ open, onClose, onDone }) {
   )
 }
 
-function RoutingRules() {
+function RoutingRules({ status, refreshStatus }) {
   const toast = useToast()
   const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
   const { data: geo } = usePoll(api.geoCategories, 600000)
@@ -520,16 +520,17 @@ function RoutingRules() {
         bypass: draft.bypass,
         force_proxy: draft.force_proxy,
         bypass_torrents: Boolean(draft.bypass_torrents),
+        self_vpn: Boolean(draft.self_vpn),
       })
       await api.apply()
       toast('Правила маршрутизации применены', 'ok')
-      await settle()
+      await Promise.all([settle(), refreshStatus?.()])
     } catch (err) {
       toast(err.message, 'bad', 9000)
     } finally {
       setBusy(false)
     }
-  }, [draft, settle, toast])
+  }, [draft, settle, toast, refreshStatus])
 
   if (!draft) return null
 
@@ -560,13 +561,33 @@ function RoutingRules() {
         ))}
       </datalist>
 
-      <div className="mb-6 border-b border-white/[0.06] pb-6">
+      <div className="mb-6 space-y-4 border-b border-white/[0.06] pb-6">
         <Toggle
           checked={Boolean(draft.bypass_torrents)}
           onChange={(v) => edit((d) => ({ ...d, bypass_torrents: v }))}
           label="Торренты мимо VPN"
           description="xray опознаёт DHT и uTP по содержимому, а не по портам — раздачи идут напрямую, остальное как обычно"
         />
+        <Toggle
+          checked={Boolean(draft.self_vpn)}
+          onChange={(v) => edit((d) => ({ ...d, self_vpn: v }))}
+          label="Трафик самого роутера через VPN"
+          description={
+            'apt, docker pull и curl из консоли платы уйдут в туннель, как у клиентов LAN. ' +
+            'При падении туннеля watchdog снимает заворот — консоль остаётся с прямым интернетом. ' +
+            'Общий спидтест «напрямую» в этом режиме меряет через VPN.'
+          }
+        />
+        {status?.self_vpn && (
+          <p className="-mt-1 text-xs text-slate-500">
+            Сейчас:{' '}
+            {status.self_vpn.enabled
+              ? status.self_vpn.active
+                ? <span className="text-emerald-300">заворот активен</span>
+                : <span className="text-amber-300">включён, ждёт туннель</span>
+              : 'выключен'}
+          </p>
+        )}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">

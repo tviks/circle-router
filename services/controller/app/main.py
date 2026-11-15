@@ -31,7 +31,7 @@ app = FastAPI(title="circle-router", docs_url=None, redoc_url=None)
 EDITABLE = {"vpn_enabled", "bypass", "force_proxy", "wan", "lan", "dhcp", "dns",
             "tproxy", "firewall", "uplink_access", "port_forward", "adblock",
             "speedtest", "block_quic", "bypass_torrents", "log_level", "failover",
-            "wifi"}
+            "wifi", "self_vpn"}
 
 
 # ── схемы запросов ───────────────────────────────────────────────────────────
@@ -225,6 +225,12 @@ def status(_: str = Depends(auth.require_user)):
                    "networks": firewall.uplink_networks(cfg)},
         "services": _service_status(),
         "pppoe": pppoe.status() if cfg["wan"].get("mode") == "pppoe" else None,
+        # Заворот собственного трафика роутера в туннель: желаемое и то,
+        # что реально наложено nft'ами (снят при failover вместе с TPROXY).
+        "self_vpn": {
+            "enabled": bool(cfg.get("self_vpn")),
+            "active": firewall.self_vpn_active(),
+        },
         "wifi": wifi.status(cfg),
         "host": {
             "uptime": netctl.host_uptime(),
@@ -292,7 +298,8 @@ def post_config(patch: dict, _: str = Depends(auth.require_user)):
 
     cfg = state.update(mutate)
     problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg) \
-        + netctl.validate_lan(cfg) + wifi.validate(cfg)
+        + netctl.validate_lan(cfg) + wifi.validate(cfg) \
+        + xray_build.selfvpn_problems(cfg)
     return {"ok": not problems, "problems": problems, "config": get_config()}
 
 
@@ -340,7 +347,7 @@ def post_restore(payload: dict, _: str = Depends(auth.require_user)):
     # не было, и прогоняем миграции, как при обычном чтении.
     restored = state.normalize(payload["config"])
     problems = dnsmasq_cfg.validate(restored) + firewall.validate_forwards(restored) \
-        + netctl.validate_lan(restored)
+        + netctl.validate_lan(restored) + wifi.validate(restored)
     if problems:
         return {"ok": False, "problems": problems}
 

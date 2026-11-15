@@ -10,7 +10,7 @@ import ipaddress
 import json
 import logging
 
-from . import netctl, proxylists, settings, state
+from . import netctl, proxylists, settings, state, xray_build
 from .shell import out, run
 
 log = logging.getLogger("circle.firewall")
@@ -414,6 +414,7 @@ def tproxy_ruleset(cfg, enabled):
     table = f"ip {settings.NFT_MANGLE}"
     smart = proxylists.enabled(cfg)
     static_nets = proxylists.cached_subnets(cfg) if smart else []
+    self_vpn = enabled and bool(cfg.get("self_vpn"))
 
     script = [
         f"add table {table}",
@@ -424,6 +425,12 @@ def tproxy_ruleset(cfg, enabled):
         f"add chain {table} prerouting "
         "{ type filter hook prerouting priority mangle; policy accept; }",
         f"flush chain {table} prerouting",
+        # Цепочка заворота собственного трафика роутера объявляется всегда:
+        # пустая — значит выключен. Иначе при выключении self_vpn старые
+        # правила остались бы метить пакеты хоста в никуда.
+        f"add chain {table} output "
+        "{ type route hook output priority mangle; policy accept; }",
+        f"flush chain {table} output",
         f"flush set {table} bypass4",
         f"flush set {table} {proxylists.STATIC_SET}",
         f"add element {table} bypass4 {{ {_bypass_elements(cfg)} }}",
@@ -439,6 +446,20 @@ def tproxy_ruleset(cfg, enabled):
     port = int(cfg["tproxy"]["port"])
     mark = int(cfg["tproxy"]["fwmark"])
     chain = f"add rule {table} prerouting"
+    if self_vpn:
+        script.append(f"add set {table} selfvpn_skip "
+                      "{ type ipv4_addr; flags interval; }")
+        script.append(f"flush set {table} selfvpn_skip")
+        endpoints = xray_build.wireguard_endpoints(cfg)
+        if endpoints:
+            script.append(f"add element {table} selfvpn_skip "
+                          f"{{ {', '.join(endpoints)} }}")
+        # Пакеты, уже переразмеченные output-цепочкой ниже: re-route в
+        # таблицу tproxy возвращает их с iif lo — снимаем тем же инбаундом,
+        # что и LAN (dokodemo-door всё равно слушает на всех адресах).
+        script.append(f'{chain} iifname "lo" meta mark {mark} '
+                      f'meta l4proto {{ tcp, udp }} tproxy to :{port} '
+                      f"meta mark set {mark} accept")
     script += [
         f"{chain} ip daddr @bypass4 accept",
         # Обращения к собственным адресам роутера (включая внешний) в прокси не
@@ -469,7 +490,38 @@ def tproxy_ruleset(cfg, enabled):
     for proto in ("tcp", "udp"):
         script.append(f"{chain} {match} meta l4proto {proto} "
                       f"tproxy to :{port} meta mark set {mark} accept")
+
+    if self_vpn:
+        out_chain = f"add rule {table} output"
+        script += [
+            # Пакеты самого xray: аутбаундам при self_vpn проставлен
+            # sockopt.mark (xray_build.build) — из заворота их выпускаем
+            # первым же правилом, иначе каждый аутбаунд зациклится сам в себя.
+            f"{out_chain} meta mark {settings.XRAY_MARK:#x} return",
+            # TPROXY переносит только tcp/udp: пинг и прочий icmp из консоли
+            # остаются прямыми, а не рвутся на переразмеченном маршруте.
+            f"{out_chain} meta l4proto icmp return",
+            f"{out_chain} fib daddr type local return",
+            f"{out_chain} ip daddr @bypass4 return",
+            # DNS хоста (systemd-resolved, upstream dnsmasq) и DHCP-офферы —
+            # напрямую: без петли резолва и вразрез с выдачей адресов.
+            f"{out_chain} meta l4proto {{ tcp, udp }} th dport 53 return",
+            f"{out_chain} udp sport 67 return",
+            # UDP-инкапсуляция wireguard-серверов, если xray проигнорировал
+            # sockopt.mark на этом аутбаунде.
+            f"{out_chain} ip daddr @selfvpn_skip return",
+            # Дальше сработает ip rule fwmark -> таблица tproxy (local dev lo),
+            # а prerouting-правило выше снимет пакет тем же tproxy-инбаундом.
+            f"{out_chain} meta mark set {mark}",
+        ]
     return "\n".join(script) + "\n"
+
+
+def self_vpn_active():
+    """Заворот локального трафика: непустая цепочка output (управляется
+    watchdog'ом синхронно с TPROXY)."""
+    return "meta mark set" in out(["nft", "list", "chain", "ip",
+                                   settings.NFT_MANGLE, "output"])
 
 
 ACCT_FAMILY = "netdev"

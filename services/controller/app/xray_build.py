@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import socket
 import time
 
 from . import settings, state, xray_url
@@ -60,6 +61,68 @@ def extra_outbounds_for(server):
                 sockopt.pop("mark", None)
             result.append(extra)
     return result
+
+
+def _wg_endpoint_hosts(server):
+    """Хосты wireguard-эндпоинтов сервера (основной outbound и extras)."""
+    outbounds = []
+    if state.server_has_target(server):
+        try:
+            main_ob = outbound_for(server)
+            if main_ob:
+                outbounds.append(main_ob)
+        except Exception:                          # noqa: BLE001 — валидируется выше
+            pass
+    for raw in (server or {}).get("extra_outbounds") or []:
+        if isinstance(raw, dict) and raw.get("protocol") == "wireguard":
+            outbounds.append(raw)
+    hosts = []
+    for ob in outbounds:
+        if ob.get("protocol") != "wireguard":
+            continue
+        for peer in ((ob.get("settings") or {}).get("peers") or []):
+            endpoint = str(peer.get("endpoint") or "").strip()
+            host = endpoint.rsplit(":", 1)[0].strip("[]") if endpoint else ""
+            if host and host not in hosts:
+                hosts.append(host)
+    return hosts
+
+
+def wireguard_endpoints(cfg):
+    """IP-адреса wireguard-эндпоинтов активного сервера.
+
+    Нужны firewall'у для nft-сета selfvpn_skip: инкапсуляция wireguard не
+    должна попадать в заворот собственного трафика (self_vpn), даже если
+    sockopt.mark на wireguard-аутбаунде xray не сработает. Домены резолвим
+    best-effort — при неудаче адрес в сет не попадёт, а selfvpn_problems
+    напомнит указать сервер IP-адресом.
+    """
+    server = state.active_server(cfg)
+    ips = set()
+    for host in _wg_endpoint_hosts(server):
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+            ips.add(infos[0][4][0])
+        except OSError as exc:
+            log.warning("wireguard-эндпоинт %s не резолвится: %s", host, exc)
+    return sorted(ips)
+
+
+def selfvpn_problems(cfg):
+    """Претензии к self_vpn: доменные wireguard-эндпоинты, не поддающиеся
+    резолву, рискуют закольцевать заворот локального трафика."""
+    if not cfg.get("self_vpn"):
+        return []
+    server = state.active_server(cfg)
+    problems = []
+    for host in _wg_endpoint_hosts(server):
+        try:
+            socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError:
+            problems.append(f"self_vpn: wireguard-эндпоинт «{host}» не резолвится "
+                            "в IP — укажите сервер адресом, иначе его UDP может "
+                            "зациклиться в завороте")
+    return problems
 
 
 def routing_rules(cfg, vpn_enabled):
@@ -194,8 +257,9 @@ def build(cfg):
         })
 
     outbounds = []
-    # Никакого sockopt.mark на аутбаунде: иначе собственные пакеты xray уйдут
-    # в ту же policy-таблицу и закольцуются.
+    # sockopt.mark на аутбаундах не ставится (см. блок self_vpn ниже): с
+    # mark'ом tproxy.fwmark собственные пакеты xray ушли бы в policy-таблицу
+    # и закольцевались.
     if proxy_outbound and vpn_enabled:
         outbounds.append(proxy_outbound)
         outbounds.extend(extra_outbounds_for(server))
@@ -207,6 +271,18 @@ def build(cfg):
     if not vpn_enabled:
         # xray берёт первый аутбаунд как дефолтный.
         outbounds.sort(key=lambda o: 0 if o["tag"] == "direct" else 1)
+    elif cfg.get("self_vpn"):
+        # Трафик самого роутера заворачивается в tproxy-инбаунд policy-роутингом
+        # по fwmark (см. firewall.apply_tproxy). Пакеты самого xray обязаны
+        # нести другой mark — иначе output-цепочка вернёт их в заворот, и
+        # каждый аутбаунд закольцуется сам в себя. По умолчанию mark'а нет
+        # именно поэтому; wireguard-аутбаунд sockopt может проигнорировать —
+        # для него страховка в nft (сет selfvpn_skip).
+        for ob in outbounds:
+            if ob.get("protocol") in ("blackhole", "dns"):
+                continue
+            stream = ob.setdefault("streamSettings", {})
+            stream.setdefault("sockopt", {})["mark"] = settings.XRAY_MARK
 
     # В умном режиме в xray попадают только адреса, уже отобранные DNS-списком,
     # так что IPIfNonMatch лишь добавлял бы DNS-запрос на каждое соединение,

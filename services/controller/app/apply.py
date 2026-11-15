@@ -50,6 +50,7 @@ def reconcile(restart_services=True):
         errors.extend(firewall.validate_forwards(cfg))
         errors.extend(netctl.validate_lan(cfg))
         errors.extend(wifi.validate(cfg))
+        errors.extend(xray_build.selfvpn_problems(cfg))
 
         members = netctl.lan_members(cfg)
         netctl.mark_unmanaged(members)
