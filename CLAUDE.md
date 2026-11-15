@@ -19,7 +19,7 @@ services/controller/      FastAPI-мозг, privileged; в образе есть
   app/xray_build.py       сборка /etc/xray/config.json, validate() через `xray run -test`
   app/xray_url.py         share-ссылки ↔ outbound
   app/firewall.py         nftables (свои таблицы circle_*), DOCKER-USER
-  app/netctl.py           sysctl, ip rule/route, адреса
+  app/netctl.py           sysctl, ip rule/route, адреса, мост свич-портов (br-lan)
   app/stats.py            сэмплер метрик (2 с), SQLite-история
   app/speedtest.py        замер через конкретный сервер (временный xray + HTTP-инбаунд)
   app/tunnel.py           монитор живости туннеля → failover на прямой интернет
@@ -37,9 +37,18 @@ web/                      React + Vite + Tailwind; страницы в src/pages
 
 ## Как устроено главное
 
-- Трафик LAN → nft TPROXY → xray `tproxy-in` → `proxy`/`direct`. Watchdog снимает
-  TPROXY, если xray не слушает порт ИЛИ (failover включён и) `tunnel.monitor` не
-  в состоянии `up`. Состояние watchdog: `up` / `down` / `failover`.
+- Трафик LAN → nft TPROXY → xray `tproxy-in` → `proxy`/`direct`. UDP идёт тем же
+  путём, что TCP: отдельного правила «UDP напрямую» нет. `block_quic` выключен
+  по умолчанию; своим Vision-нодам нужен flow `xtls-rprx-vision-udp443`, иначе
+  xray сам отбрасывает UDP/443. Импортированным ссылкам flow не переписываем:
+  sing-box-серверы проверяют строку и отвергли бы соединение целиком.
+- WireGuard — userspace в xray-core (и инбаунд, и аутбаунд), без wg-quick. В
+  контейнере клиентский аутбаунд всегда с `noKernelTun: true` (нет
+  /dev/net/tun, но есть NET_ADMIN — иначе ядро выберет TUN и упадёт).
+  `xray_url.parse_url` понимает `wireguard://` и `.conf` `[Interface]/[Peer]`.
+- Watchdog снимает TPROXY, если xray не слушает порт ИЛИ (failover включён и)
+  `tunnel.monitor` не в состоянии `up`. Состояние watchdog: `up` / `down` /
+  `failover`.
 - `health-in` — HTTP-инбаунд xray на 127.0.0.1:10809, всегда → `proxy`. Через него
   ходят монитор туннеля и SSH метрик нод (внутри туннеля).
 - Сервер в `cfg.servers` может иметь `outbound` + `extra_outbounds` (у нод —
@@ -49,17 +58,35 @@ web/                      React + Vite + Tailwind; страницы в src/pages
   `GET /api/config` вырезает `nodes`). Кандидат = {transport, port, sni, fp, frag};
   ключ `node_build.cand_key()` (продублирован в Nodes.jsx как candKey).
 - Длинные операции — фоновые потоки с журналом (`nodes._jobs`), UI опрашивает.
+- `bypass_torrents` (EDITABLE, вкл по умолчанию): правило `protocol: bittorrent`
+  → `direct` в `xray_build.routing_rules`, до `force_proxy`. Сниффер уже есть
+  (routeOnly); опознаёт DHT/uTP по содержимому, не по портам.
+- Бэкап: `GET /api/backup` — весь router.json С секретами (pppoe, nodes),
+  `POST /api/restore` — замена + reconcile; нормализация через `state.normalize`,
+  валидация как у `POST /api/config` (problems → ок:false, без записи).
+- Резервации DHCP (`dhcp.reservations`): «булавка» на странице Клиентов делает
+  patchConfig+apply одним кликом; `dnsmasq_cfg.validate` проверяет формат MAC
+  (`aa:bb:cc:dd:ee:ff`) и дубли MAC/IP.
+- Свич-порты (`lan.switch_ports`, на платах с >2 ethernet): собираются мостом
+  `br-lan` с LAN-портом, адрес и dnsmasq живут на мосту. Всюду, где нужно имя
+  LAN-девайса, брать `netctl.lan_device(cfg)`, а не `cfg["lan"]["interface"]`
+  (тот всегда физический порт). На платах с двумя портами мост не создаётся.
 
-## Боевой роутер (NanoPi R3S, Armbian 24.04, aarch64)
+## Боевой роутер 192.168.11.1 (aarch64, 3 порта: wan1/lan1/lan2)
 
-- Проект в `/root/circle-router` (git-клон; деплой — git bundle + checkout ветки,
-  `.env` и `data/` не трогать). LAN `end0` 192.168.11.1, WAN `enp1s0` + PPPoE `ppp0`.
-- Включён умный прокси (`smart_proxy.enabled`), flowtable, RPS. Сборка образов идёт
-  прямо на плате (npm build ~ минуты).
-- Хост резолвит через systemd-resolved → `resolved.conf.d/circle.conf`; должен
-  смотреть в публичные DNS, не в 192.168.11.1 (см. README «DNS самого роутера»).
-- Из Git Bash к роутеру: paramiko-скрипт в scratchpad; пути вида `/tmp/x` в аргументах
-  портит MSYS — ставить `MSYS_NO_PATHCONV=1`.
+- Проект в `/root/circle-router` (git-клон ветки `self_hosted_node`; фичи лежат
+  несокоммиченными и локально, и на плате — деплой = tar изменённых файлов).
+  WAN = `lan2` (PPPoE `ppp0` поверх него), LAN = `lan1` 192.168.11.1/24,
+  `wan1` свободен — кандидат в свич-порты. `.env` и `data/` не трогать.
+- Включён умный прокси (`smart_proxy.enabled`), flowtable, RPS. Сборка образов
+  идёт прямо на плате (vite build — десятки секунд, слои docker кэшируются).
+- Хост резолвит через systemd-resolved → `/etc/systemd/resolved.conf.d/circle.conf`
+  (публичные 1.1.1.1/8.8.8.8). После ребута платы конфиг может исчезнуть — без него
+  сборка docker падает на резолве registry-1.docker.io (см. README «DNS самого роутера»).
+- Из Git Bash к роутеру: `circle-scratch/pi.py` с `CR_SSH_HOST=192.168.11.1`
+  (`python -I pi.py exec/put/get`); пути вида `/tmp/x` в аргументах портит MSYS —
+  ставить `MSYS_NO_PATHCONV=1`, команда — с `< /dev/null`. Часы платы могут
+  отставать от локальных — tar ругается на timestamps в будущем, это не страшно.
 
 ## Проверено на практике (xray 26.3.27)
 
