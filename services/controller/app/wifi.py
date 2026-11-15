@@ -47,9 +47,20 @@ _state = {
 _lock = threading.Lock()
 
 
+# 5 ГГц без DFS: каналы 36–48 и 149–161, каждый — целиком свой блок 80 МГц.
+# 52–64 и 100+ требуют radar detection — точке доступа на rtw88 не даём.
+BAND_A_CHANNELS = (36, 40, 44, 48, 149, 153, 157, 161)
+# Центральная частота VHT80 для блока, в котором лежит канал.
+_VHT80_CENTER = {36: 42, 40: 42, 44: 42, 48: 42,
+                 149: 155, 153: 155, 157: 155, 161: 155}
+
+
 def _write_config(cfg):
-    """hostapd.conf. Значения в кавычках: иначе '#' в пароле/SSID съедается
-    парсером hostapd как комментарий."""
+    """hostapd.conf. Значения пишутся как есть: парсер hostapd снимает
+    кавычки только у отдельных опций — у ssid= они становились частью
+    имени сети. '#' опасен лишь в начале строки (полнострочный комментарий),
+    внутри значения он безвреден. Возвращает True, если содержимое
+    изменилось (работающий hostapd надо перезапускать)."""
     wifi = cfg["wifi"]
     iface = (wifi.get("interface") or "").strip() or netctl.first_wlan()
     lines = [
@@ -59,27 +70,52 @@ def _write_config(cfg):
         # DHCP, DNS и TPROXY достаются wifi-клиентам без отдельных правил.
         f"bridge={netctl.lan_device(cfg)}",
         "driver=nl80211",
-        f'ssid="{wifi.get("ssid", "")}"',
+        f"ssid={wifi.get('ssid', '')}",
         "country_code=RU",
         "ieee80211d=1",
-        # 2.4 ГГц, HT20: донгл 1x1, HT40 на заглушённом эфире только мешает.
-        # channel=0 (hostapd ACS) rtw88 не тянет — «ACS: Failed to start», так
-        # что пустое значение тихо превращается в 6-й канал.
-        "hw_mode=g",
-        f"channel={max(1, min(13, int(wifi.get('channel') or 6)))}",
-        "ieee80211n=1",
         "wmm_enabled=1",
         "macaddr_acl=0",
         "auth_algs=1",
         "wpa=2",
         "wpa_key_mgmt=WPA-PSK",
         "rsn_pairwise=CCMP",
-        f'wpa_passphrase="{wifi.get("password", "")}"',
+        f"wpa_passphrase={wifi.get('password', '')}",
     ]
+    if (wifi.get("band") or "g").lower() == "a":
+        # 5 ГГц: 802.11ac (VHT80) поверх HT40. ACS не используем и здесь —
+        # rtw88 его не тянет, канал фиксированный.
+        channel = int(wifi.get("channel") or 36)
+        if channel not in BAND_A_CHANNELS:
+            channel = 36
+        ht = "HT40+" if channel in (36, 40, 149, 153) else "HT40-"
+        lines += [
+            "hw_mode=a",
+            f"channel={channel}",
+            "ieee80211n=1",
+            f"ht_capab=[{ht}][SHORT-GI-20][SHORT-GI-40]",
+            "ieee80211ac=1",
+            "vht_oper_chwidth=1",
+            f"vht_oper_centr_freq_seg0_idx={_VHT80_CENTER[channel]}",
+        ]
+    else:
+        # 2.4 ГГц, HT20: донгл 1x1, HT40 на заглушённом эфире только мешает.
+        # channel=0 (hostapd ACS) rtw88 не тянет — «ACS: Failed to start», так
+        # что пустое значение тихо превращается в 6-й канал.
+        lines += [
+            "hw_mode=g",
+            f"channel={max(1, min(13, int(wifi.get('channel') or 6)))}",
+            "ieee80211n=1",
+        ]
     if wifi.get("hidden"):
         lines.append("ignore_broadcast_ssid=2")
+    text = "\n".join(lines) + "\n"
+    try:
+        changed = CONFIG_PATH.read_text(encoding="utf-8") != text
+    except OSError:
+        changed = True
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    CONFIG_PATH.write_text(text, encoding="utf-8")
+    return changed
 
 
 def _running_pids():
@@ -158,7 +194,12 @@ def start(cfg):
                                     "(драйвер? usb_modeswitch?)")
         log.warning("wifi: %s", _state["last_error"])
         return
-    _write_config(cfg)
+    changed = _write_config(cfg)
+    if changed:
+        # hostapd конфиг при старте читает один раз: смена SSID/пароля/канала
+        # требует честного перезапуска, иначе точка продолжит жить по-старому.
+        log.info("wifi: конфиг изменился — перезапускаю hostapd")
+        stop()
     with _lock:
         alive = _state["thread"] is not None and _state["thread"].is_alive()
         if _state["want"] and alive:
@@ -272,15 +313,15 @@ def validate(cfg):
     ssid = (wifi.get("ssid") or "").strip()
     if not 1 <= len(ssid) <= 32:
         problems.append("WiFi: имя сети (SSID) — от 1 до 32 символов")
-    elif '"' in ssid:
-        problems.append("WiFi: SSID не должен содержать кавычек")
     psk = wifi.get("password") or ""
     if not 8 <= len(psk) <= 63 or not psk.isascii():
         problems.append("WiFi: пароль — от 8 до 63 ASCII-символов (WPA2)")
-    elif '"' in psk:
-        problems.append("WiFi: пароль не должен содержать кавычек")
     channel = int(wifi.get("channel") or 0)
-    if channel not in range(1, 14):
+    if (wifi.get("band") or "g").lower() == "a":
+        if channel not in BAND_A_CHANNELS:
+            problems.append("WiFi: для 5 ГГц канал — 36/40/44/48 или 149/153/157/161 "
+                            "(без DFS)")
+    elif channel not in range(1, 14):
         problems.append("WiFi: канал — число 1–13 (авто-выбор у rtw88 не работает)")
     iface = (wifi.get("interface") or "").strip()
     if iface and not re.match(r"^wlan\d{1,2}$", iface):

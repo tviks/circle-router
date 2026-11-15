@@ -168,6 +168,7 @@ def _default_config():
             "enabled": False,
             "ssid": "CircleRouter",
             "password": "",
+            "band": "g",        # g = 2.4 ГГц, a = 5 ГГц (802.11ac)
             "channel": 6,       # фиксированный: ACS у rtw88 не работает
             "hidden": False,
             "interface": "",    # пусто = первый wlan* интерфейс

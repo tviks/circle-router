@@ -64,8 +64,11 @@ web/                      React + Vite + Tailwind; страницы в src/pages
   (nl80211 хоста виден из host netns), wlan-интерфейс — член `br-lan`
   (`netctl.lan_members` добавляет его при `wifi.enabled`), клиенты = обычные
   клиенты LAN. Супервизор — по образцу pppoe (поколения, рестарт 5 с).
-  ACS у rtw88 не работает — канал только фиксированный 1–13. Адаптер
-  RTL8811CU из CD-ROM (`0bda:1a2b`) переводит usb_modeswitch на хосте
+  ACS у rtw88 не работает — канал только фиксированный; `band: g|a`
+  (2.4 ГГц HT20 каналы 1–13 / 5 ГГц 802.11ac VHT80 каналы 36–48, 149–161 —
+  без DFS). Значения в hostapd.conf — БЕЗ кавычек: парсер hostapd у `ssid=`
+  их не снимает, кавычки становились частью имени сети. Адаптер RTL8811CU
+  из CD-ROM (`0bda:1a2b`) переводит usb_modeswitch на хосте
   (`/etc/usb_modeswitch.d/0bda:1a2b`), имя wlan0 даёт systemd .link
   (`Driver=rtw88_8821cu`); в образе контроллера нужны hostapd, iw, usbutils.
 - `health-in` — HTTP-инбаунд xray на 127.0.0.1:10809, всегда → `proxy`. Через него

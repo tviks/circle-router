@@ -18,6 +18,14 @@ import {
 
 const signalTone = (dbm) => (dbm >= -60 ? 'ok' : dbm >= -70 ? 'warn' : 'bad')
 
+// Каналы без DFS: на 5 ГГц 36–48 и 149–161 (каждый — блок 80 МГц целиком).
+// Должно совпадать с BAND_A_CHANNELS в wifi.py.
+const BAND_CHANNELS = {
+  g: Array.from({ length: 13 }, (_, i) => i + 1),
+  a: [36, 40, 44, 48, 149, 153, 157, 161],
+}
+const DEFAULT_CHANNEL = { g: 6, a: 36 }
+
 function Hint({ children }) {
   return <p className="text-xs leading-relaxed text-slate-500">{children}</p>
 }
@@ -180,13 +188,28 @@ export default function WifiPage({ refreshStatus }) {
                 placeholder="минимум 8 символов"
               />
             </Field>
-            <Field label="Канал (2.4 ГГц)" hint="авто-выбор канала у rtw88 не работает — канал фиксированный">
+            <Field label="Диапазон">
               <Select
-                value={String(wifi.channel ?? 6)}
+                value={wifi.band === 'a' ? 'a' : 'g'}
+                onChange={(e) => {
+                  const band = e.target.value
+                  set('wifi.band', band)
+                  if (!BAND_CHANNELS[band].includes(Number(wifi.channel))) {
+                    set('wifi.channel', DEFAULT_CHANNEL[band])
+                  }
+                }}
+              >
+                <option value="g">2.4 ГГц — дальше бьёт, лучше сквозь стены</option>
+                <option value="a">5 ГГц (802.11ac) — быстрее, но короче</option>
+              </Select>
+            </Field>
+            <Field label="Канал" hint="авто-выбор канала у rtw88 не работает — канал фиксированный">
+              <Select
+                value={String(wifi.channel ?? DEFAULT_CHANNEL[wifi.band === 'a' ? 'a' : 'g'])}
                 onChange={(e) => set('wifi.channel', Number(e.target.value))}
               >
-                {Array.from({ length: 13 }, (_, i) => (
-                  <option key={i + 1} value={i + 1}>{i + 1}</option>
+                {BAND_CHANNELS[wifi.band === 'a' ? 'a' : 'g'].map((ch) => (
+                  <option key={ch} value={ch}>{ch}</option>
                 ))}
               </Select>
             </Field>
@@ -201,8 +224,9 @@ export default function WifiPage({ refreshStatus }) {
             </Field>
           </div>
           <Hint>
-            Донгл 1×1 на 2.4 ГГц: рассчитывайте на десятки мегабит, для IoT и
-            телефона — самое то. Канал по умолчанию RU: 1–13 разрешены.
+            Донгл 1×1: 2.4 ГГц — десятки мегабит (HT20), 5 ГГц — 802.11ac на
+            80 МГц (до ~200–300 Мбит/с в упор, но хуже сквозь стены). Каналы
+            5 ГГц — без DFS: 36–48 и 149–161. Регуляционный домен RU.
           </Hint>
         </div>
       </Card>
