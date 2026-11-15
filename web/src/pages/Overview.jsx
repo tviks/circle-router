@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
+  Cable,
   Clock,
   Cpu,
   Globe2,
@@ -15,6 +16,7 @@ import { usePoll } from '../lib/hooks'
 import { bytes, duration, rate } from '../lib/format'
 import { HistoryChart, SpeedChart } from '../components/charts'
 import { ServerHealth } from '../components/system'
+import { WanSpeedCard } from '../components/wanspeed'
 import { Card, Chip, Dot, Spinner, StatTile, Toggle, useToast } from '../components/ui'
 
 const RANGES = [
@@ -37,6 +39,8 @@ export default function Overview({ status, refreshStatus }) {
   const current = live?.current ?? {}
   const vpn = status?.vpn
   const vpnActive = Boolean(vpn?.routing_active && vpn?.xray_listening)
+  const failover = vpn?.enabled && !vpnActive && vpn?.watchdog_state === 'failover'
+  const tunnel = vpn?.tunnel
 
   const toggleVpn = useCallback(
     async (next) => {
@@ -115,12 +119,30 @@ export default function Overview({ status, refreshStatus }) {
                 }
               />
               <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                <Chip tone={vpnActive ? 'ok' : vpn?.enabled ? 'warn' : 'mute'}>
-                  <Dot tone={vpnActive ? 'ok' : vpn?.enabled ? 'warn' : 'mute'} />
-                  {vpnActive ? 'TPROXY активен' : vpn?.enabled ? 'ожидает xray' : 'прямой роутинг'}
+                <Chip tone={vpnActive ? 'ok' : failover ? 'bad' : vpn?.enabled ? 'warn' : 'mute'}>
+                  <Dot tone={vpnActive ? 'ok' : failover ? 'bad' : vpn?.enabled ? 'warn' : 'mute'} />
+                  {vpnActive
+                    ? 'TPROXY активен'
+                    : failover
+                      ? 'обход: клиенты напрямую'
+                      : vpn?.enabled
+                        ? 'ожидает xray'
+                        : 'прямой роутинг'}
                 </Chip>
+                {vpnActive && tunnel?.latency_ms != null && (
+                  <Chip tone="mute">
+                    <span className="mono">{tunnel.latency_ms} мс</span> до выхода
+                  </Chip>
+                )}
                 {busy && <Spinner size={13} className="text-slate-500" />}
               </div>
+              {failover && (
+                <p className="mt-3 rounded-lg border border-rose-500/25 bg-rose-500/[0.08] px-3 py-2 text-xs text-rose-200">
+                  Сервер не отвечает{tunnel?.error ? ` (${tunnel.error})` : ''} — чтобы не терять
+                  связь, клиенты временно ходят в интернет напрямую. VPN вернётся сам, как только
+                  туннель оживёт.
+                </p>
+              )}
               {vpn?.enabled && !vpn?.effective && (
                 <p className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/[0.08] px-3 py-2 text-xs text-amber-200">
                   xray не принял конфигурацию сервера, работает прямой роутинг.
@@ -148,6 +170,10 @@ export default function Overview({ status, refreshStatus }) {
           </div>
         </Card>
       </div>
+
+      <WanSpeedCard />
+
+      <PortsCard status={status} />
 
       <ServerHealth system={system} />
 
@@ -217,5 +243,74 @@ function Metric({ icon: Icon, label, value }) {
       </div>
       <div className="mono mt-0.5 text-slate-200">{value}</div>
     </div>
+  )
+}
+
+/** Роль порта из текущей конфигурации сети: WAN, LAN, член моста или свободный. */
+function portRole(name, status) {
+  const lan = status?.lan
+  const wan = status?.wan
+  if (name && name === wan?.physical) return { label: 'WAN', tone: 'info' }
+  if (name === lan?.device && lan?.device !== lan?.interface)
+    return { label: 'LAN · мост', tone: 'ok' }
+  if (name === lan?.interface) return { label: 'LAN', tone: 'ok' }
+  if ((lan?.switch_ports ?? []).includes(name)) return { label: 'LAN · свич', tone: 'ok' }
+  return { label: 'свободный', tone: 'mute' }
+}
+
+/** Согласованная линком скорость и дуплекс; у моста вместо них — порты-члены. */
+function linkText(iface, lan) {
+  if (iface.name === lan?.device && lan?.switch_ports?.length)
+    return `собран из портов: ${(lan.members ?? []).join(', ')}`
+  if (!iface.carrier) return 'нет кабеля'
+  if (iface.speed == null) return 'линк есть, скорость неизвестна'
+  const speed =
+    iface.speed >= 1000 ? `${iface.speed / 1000} Гбит/с` : `${iface.speed} Мбит/с`
+  const duplex =
+    iface.duplex === 'full'
+      ? 'полный дуплекс'
+      : iface.duplex === 'half'
+        ? 'полудуплекс'
+        : ''
+  return [speed, duplex].filter(Boolean).join(' · ')
+}
+
+function PortsCard({ status }) {
+  const { data: interfaces } = usePoll(api.interfaces, 5000)
+  // ppp-интерфейсы — не ethernet, сам мост не показываем: его члены и так тут.
+  const ports = (interfaces ?? []).filter(
+    (i) => !/^ppp/.test(i.name) && !(i.name === status?.lan?.device && status?.lan?.switch_ports?.length)
+  )
+
+  return (
+    <Card
+      title="Ethernet-порты"
+      subtitle="скорость и дуплекс согласуются автосогласованием, роль порта — из настроек сети"
+      bodyClass="p-0"
+    >
+      {ports.length === 0 ? (
+        <p className="px-6 py-8 text-center text-sm text-slate-600">
+          Порты не видны — контроллер ещё не собрал данные об интерфейсах.
+        </p>
+      ) : (
+        <ul className="divide-y divide-white/[0.06]">
+          {ports.map((iface) => {
+            const role = portRole(iface.name, status)
+            return (
+              <li key={iface.name} className="flex flex-wrap items-center gap-3 px-5 py-3 sm:px-6">
+                <Cable size={15} className={iface.carrier ? 'text-emerald-400' : 'text-slate-700'} />
+                <span className="mono w-28 text-slate-200">{iface.name}</span>
+                <Chip tone={role.tone}>{role.label}</Chip>
+                <span className="mono text-xs text-slate-400">{linkText(iface, status?.lan)}</span>
+                <span className="mono min-w-0 flex-1 truncate text-xs text-slate-500">
+                  {iface.addresses.join(', ') || 'без адреса'}
+                </span>
+                <span className="mono text-xs text-slate-700">{iface.mac}</span>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </Card>
   )
 }

@@ -119,6 +119,14 @@ class NotCached(Exception):
     """Список ещё не скачан, а лезть в сеть в этом вызове нельзя."""
 
 
+class Stale(Exception):
+    """Скачать не вышло, но есть прошлая версия из кеша."""
+
+    def __init__(self, text, cause):
+        super().__init__(str(cause))
+        self.text = text
+
+
 def _source_text(url, download):
     """(текст, из_кеша). При download=False сеть не трогаем вовсе.
 
@@ -127,7 +135,14 @@ def _source_text(url, download):
     """
     path = _cache_path(url)
     if download:
-        text = _download(url)
+        try:
+            text = _download(url)
+        except Exception as exc:
+            # Сеть подвела — живём на прошлой версии. Иначе один сбой DNS
+            # обнулял блок-лист целиком до следующего удачного обновления.
+            if path.exists():
+                raise Stale(path.read_text(encoding="utf-8"), exc) from exc
+            raise
         path.write_text(text, encoding="utf-8")
         return text, False
     if path.exists():
@@ -172,6 +187,7 @@ def build(cfg, download=False):
     with _build_lock:
         adblock = cfg.get("adblock") or {}
         report = {"sources": [], "domains": 0, "downloaded": download}
+        fresh = False
 
         if not adblock.get("enabled", True):
             changed = _write("# Блокировщик выключен в панели.\n")
@@ -193,7 +209,14 @@ def build(cfg, download=False):
                 text, cached = _source_text(source["url"], download)
                 parsed = parse(text)
                 domains |= parsed
+                fresh = fresh or not cached
                 entry.update({"count": len(parsed), "ok": True, "cached": cached})
+            except Stale as exc:
+                parsed = parse(exc.text)
+                domains |= parsed
+                entry.update({"count": len(parsed), "ok": False, "cached": True,
+                              "error": f"не обновился ({str(exc)[:120]}), работает прошлая версия"})
+                log.warning("список %s не обновился, беру кеш: %s", source["url"], exc)
             except NotCached as exc:
                 # Не ошибка конфигурации — просто ещё не успели скачать.
                 entry.update({"count": 0, "ok": True, "pending": True, "note": str(exc)})
@@ -209,7 +232,9 @@ def build(cfg, download=False):
 
         report["domains"] = len(domains)
         changed = _write(render(domains, allowlist))
-        _remember(report, download)
+        # Метку «обновлено» ставим только за реально скачанное: иначе после
+        # сбоя сети следующая попытка отложилась бы на сутки.
+        _remember(report, download and fresh)
         return changed, report
 
 

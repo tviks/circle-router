@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import socket
 import time
 
 from . import settings, state, xray_url
@@ -14,6 +15,17 @@ log = logging.getLogger("circle.xray")
 # уходит по тем же правилам маршрутизации, что и остальной трафик, а не мимо
 # VPN напрямую с WAN-адреса.
 DNS_INBOUND_PORT = 5300
+# Тег, под которым в роутинг попадают запросы встроенного резолвера xray.
+DNS_CLIENT_TAG = "dns-internal"
+DNS_BALANCER = "dns-via-vpn"
+
+
+def _dns_failover(cfg):
+    """Резолвер уходит на direct при мёртвом туннеле, если не включён kill switch."""
+    return bool((cfg.get("failover") or {}).get("enabled", True))
+
+# HTTP-инбаунд монитора туннеля (см. tunnel.py). Только на loopback.
+HEALTH_PORT = 10809
 
 # Что реально лежит в /etc/xray/config.json. Отличается от cfg["vpn_enabled"],
 # когда конфиг с сервером не прошёл проверку и мы откатились на direct.
@@ -37,12 +49,106 @@ def outbound_for(server):
     return None
 
 
+def extra_outbounds_for(server):
+    """Вспомогательные аутбаунды сервера (у своих нод — фрагментатор
+    ClientHello, через который основной аутбаунд устанавливает TCP)."""
+    result = []
+    for raw in (server or {}).get("extra_outbounds") or []:
+        if isinstance(raw, dict) and raw.get("tag"):
+            extra = json.loads(json.dumps(raw))
+            sockopt = (extra.get("streamSettings") or {}).get("sockopt")
+            if isinstance(sockopt, dict):
+                sockopt.pop("mark", None)
+            result.append(extra)
+    return result
+
+
+def _wg_endpoint_hosts(server):
+    """Хосты wireguard-эндпоинтов сервера (основной outbound и extras)."""
+    outbounds = []
+    if state.server_has_target(server):
+        try:
+            main_ob = outbound_for(server)
+            if main_ob:
+                outbounds.append(main_ob)
+        except Exception:                          # noqa: BLE001 — валидируется выше
+            pass
+    for raw in (server or {}).get("extra_outbounds") or []:
+        if isinstance(raw, dict) and raw.get("protocol") == "wireguard":
+            outbounds.append(raw)
+    hosts = []
+    for ob in outbounds:
+        if ob.get("protocol") != "wireguard":
+            continue
+        for peer in ((ob.get("settings") or {}).get("peers") or []):
+            endpoint = str(peer.get("endpoint") or "").strip()
+            host = endpoint.rsplit(":", 1)[0].strip("[]") if endpoint else ""
+            if host and host not in hosts:
+                hosts.append(host)
+    return hosts
+
+
+def wireguard_endpoints(cfg):
+    """IP-адреса wireguard-эндпоинтов активного сервера.
+
+    Нужны firewall'у для nft-сета selfvpn_skip: инкапсуляция wireguard не
+    должна попадать в заворот собственного трафика (self_vpn), даже если
+    sockopt.mark на wireguard-аутбаунде xray не сработает. Домены резолвим
+    best-effort — при неудаче адрес в сет не попадёт, а selfvpn_problems
+    напомнит указать сервер IP-адресом.
+    """
+    server = state.active_server(cfg)
+    ips = set()
+    for host in _wg_endpoint_hosts(server):
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+            ips.add(infos[0][4][0])
+        except OSError as exc:
+            log.warning("wireguard-эндпоинт %s не резолвится: %s", host, exc)
+    return sorted(ips)
+
+
+def selfvpn_problems(cfg):
+    """Претензии к self_vpn: доменные wireguard-эндпоинты, не поддающиеся
+    резолву, рискуют закольцевать заворот локального трафика."""
+    if not cfg.get("self_vpn"):
+        return []
+    server = state.active_server(cfg)
+    problems = []
+    for host in _wg_endpoint_hosts(server):
+        try:
+            socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError:
+            problems.append(f"self_vpn: wireguard-эндпоинт «{host}» не резолвится "
+                            "в IP — укажите сервер адресом, иначе его UDP может "
+                            "зациклиться в завороте")
+    return problems
+
+
 def routing_rules(cfg, vpn_enabled):
     rules = [{"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}]
+    if vpn_enabled:
+        # Служебный инбаунд монитора туннеля всегда уходит в proxy — мимо
+        # правил обхода, иначе проверка мерила бы прямой канал.
+        rules.append({"type": "field", "inboundTag": ["health-in"], "outboundTag": "proxy"})
 
     if not vpn_enabled:
         rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"})
         return rules
+
+    # Собственные запросы резолвера xray — строго через VPN, мимо правил
+    # обхода. Иначе при bypass/failover они уйдут напрямую, а провайдер
+    # подменяет ответы даже от 8.8.8.8: на заблокированные домены прилетает
+    # NXDOMAIN.
+    if _dns_failover(cfg):
+        # …но если туннель умер, резолвер не должен умереть вместе с ним:
+        # балансировщик с одним участником и запасным direct. Иначе в обходе
+        # (tunnel.py) у клиентов перестают резолвиться домены из списков, а в
+        # режиме «весь DNS через VPN» — вообще все.
+        rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG],
+                      "balancerTag": DNS_BALANCER})
+    else:
+        rules.append({"type": "field", "inboundTag": [DNS_CLIENT_TAG], "outboundTag": "proxy"})
 
     # DNS-запросы (и локальный инбаунд, и всё, что клиенты шлют на чужой :53)
     # отдаём встроенному резолверу xray.
@@ -50,13 +156,27 @@ def routing_rules(cfg, vpn_enabled):
     rules.append({"type": "field", "inboundTag": ["tproxy-in"], "port": "53",
                   "outboundTag": "dns-out"})
 
-    if cfg.get("block_quic", True):
-        # VLESS поверх TCP не тянет UDP без xudp, поэтому QUIC режем — браузеры
-        # быстро откатываются на TCP, и он уже идёт через VPN.
+    if cfg.get("block_quic"):
+        # Необязательный обход: часть провайдеров и серверов плохо переносит
+        # UDP/443. По умолчанию QUIC идёт в туннель вместе с остальным UDP.
         rules.append({"type": "field", "network": "udp", "port": "443",
                       "outboundTag": "block"})
-    # Остальной UDP (NTP, игры, discovery) пускаем напрямую через NAT.
-    rules.append({"type": "field", "network": "udp", "outboundTag": "direct"})
+
+    if cfg.get("bypass_torrents"):
+        # Торренты — мимо VPN: сниффер bittorrent на tproxy-in (routeOnly)
+        # опознаёт DHT и uTP по содержимому, а не по портам. Стоит до
+        # force_proxy, иначе раздача к заблокированному трекеру утащила бы
+        # за собой и весь пиринговый трафик. В умном прокси правило почти
+        # не работает: пир-адреса в nft-сет proxy_dst не попадают и до xray
+        # не доезжают — там ядро и так гоняет их напрямую.
+        rules.append({"type": "field", "inboundTag": ["tproxy-in"],
+                      "protocol": ["bittorrent"], "outboundTag": "direct"})
+
+    # Отдельного правила «UDP напрямую» здесь больше нет: UDP идёт тем же
+    # путём, что и TCP, и решается правилами ниже. VLESS/VMess/Trojan несут
+    # его через XUDP поверх TCP, Shadowsocks, Hysteria2 и WireGuard — нативно.
+    # Раньше весь UDP уходил в direct: QUIC, игры, голосовые звонки и
+    # WireGuard-клиенты оставались без VPN, хотя TPROXY их уже перехватывал.
 
     # Свои же подсети и служебные адреса — всегда мимо прокси.
     rules.append({
@@ -127,12 +247,22 @@ def build(cfg):
             "settings": {"address": upstream[0], "port": 53, "network": "tcp,udp"},
         },
     ]
+    if vpn_enabled:
+        inbounds.append({
+            "tag": "health-in",
+            "listen": "127.0.0.1",
+            "port": HEALTH_PORT,
+            "protocol": "http",
+            "settings": {"allowTransparent": False},
+        })
 
     outbounds = []
-    # Никакого sockopt.mark на аутбаунде: иначе собственные пакеты xray уйдут
-    # в ту же policy-таблицу и закольцуются.
+    # sockopt.mark на аутбаундах не ставится (см. блок self_vpn ниже): с
+    # mark'ом tproxy.fwmark собственные пакеты xray ушли бы в policy-таблицу
+    # и закольцевались.
     if proxy_outbound and vpn_enabled:
         outbounds.append(proxy_outbound)
+        outbounds.extend(extra_outbounds_for(server))
     outbounds.append({"tag": "direct", "protocol": "freedom",
                       "settings": {"domainStrategy": "UseIP"}})
     outbounds.append({"tag": "block", "protocol": "blackhole"})
@@ -141,6 +271,25 @@ def build(cfg):
     if not vpn_enabled:
         # xray берёт первый аутбаунд как дефолтный.
         outbounds.sort(key=lambda o: 0 if o["tag"] == "direct" else 1)
+    elif cfg.get("self_vpn"):
+        # Трафик самого роутера заворачивается в tproxy-инбаунд policy-роутингом
+        # по fwmark (см. firewall.apply_tproxy). Пакеты самого xray обязаны
+        # нести другой mark — иначе output-цепочка вернёт их в заворот, и
+        # каждый аутбаунд закольцуется сам в себя. По умолчанию mark'а нет
+        # именно поэтому; wireguard-аутбаунд sockopt может проигнорировать —
+        # для него страховка в nft (сет selfvpn_skip).
+        for ob in outbounds:
+            if ob.get("protocol") in ("blackhole", "dns"):
+                continue
+            stream = ob.setdefault("streamSettings", {})
+            stream.setdefault("sockopt", {})["mark"] = settings.XRAY_MARK
+
+    # В умном режиме в xray попадают только адреса, уже отобранные DNS-списком,
+    # так что IPIfNonMatch лишь добавлял бы DNS-запрос на каждое соединение,
+    # у которого сниффнутый домен не совпал с правилами. AsIs матчит ip-правила
+    # по настоящему адресу назначения — ровно то, что нужно.
+    smart = vpn_enabled and bool((cfg.get("smart_proxy") or {}).get("enabled"))
+    domain_strategy = "AsIs" if smart else "IPIfNonMatch"
 
     config = {
         "log": {
@@ -156,12 +305,29 @@ def build(cfg):
                 "statsOutboundUplink": True, "statsOutboundDownlink": True,
             },
         },
-        "dns": {"servers": upstream + ["localhost"], "queryStrategy": "UseIPv4"},
+        # Без "localhost": системный резолвер хоста смотрит в наш же dnsmasq,
+        # а тот шлёт домены из списков обратно в xray — петля и таймауты.
+        "dns": {"servers": upstream, "queryStrategy": "UseIPv4",
+                "tag": DNS_CLIENT_TAG},
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "routing": {"domainStrategy": "IPIfNonMatch",
+        "routing": {"domainStrategy": domain_strategy,
+                    **({"balancers": [{"tag": DNS_BALANCER, "selector": ["proxy"],
+                                       "fallbackTag": "direct",
+                                       "strategy": {"type": "leastPing"}}]}
+                       if vpn_enabled and _dns_failover(cfg) else {}),
                     "rules": routing_rules(cfg, vpn_enabled)},
     }
+    if vpn_enabled and _dns_failover(cfg):
+        # Observatory решает, жив ли proxy для балансировщика резолвера. До
+        # первой пробы (секунды после рестарта) запросы идут через direct.
+        probe = ((cfg.get("failover") or {}).get("probe_urls") or [None])[0]
+        config["observatory"] = {
+            "subjectSelector": ["proxy"],
+            "probeUrl": probe or "https://www.gstatic.com/generate_204",
+            "probeInterval": "10s",
+            "enableConcurrency": True,
+        }
     return config, vpn_enabled, error
 
 

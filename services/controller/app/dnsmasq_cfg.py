@@ -3,11 +3,15 @@
 import ipaddress
 import logging
 import os
+import re
 import time
 
-from . import settings, state, xray_build
+from . import netctl, proxylists, settings, state, xray_build
 
 log = logging.getLogger("circle.dnsmasq")
+
+# Формат, в котором MAC лежит и в арендах dnsmasq, и в резервациях панели.
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 
 
 def render(cfg):
@@ -19,7 +23,8 @@ def render(cfg):
 
     lines = [
         "# Сгенерировано circle-router. Правки руками перезапишутся.",
-        f"interface={lan['interface']}",
+        # Слушаем LAN-девайс: физический порт или бридж, если включён свич.
+        f"interface={netctl.lan_device(cfg)}",
         f"listen-address={router_ip}",
         "bind-interfaces",
         f"except-interface={cfg['wan']['interface']}",
@@ -32,13 +37,23 @@ def render(cfg):
         f"cache-size={int(dns.get('cache_size') or 2048)}",
     ]
 
-    if dns.get("route_via_vpn", True):
+    smart = proxylists.enabled(cfg)
+    if dns.get("route_via_vpn", True) and not smart:
         # Upstream — DNS-инбаунд xray: резолвинг идёт по тем же правилам
         # маршрутизации, что и трафик, и не утекает мимо VPN.
         lines.append(f"server=127.0.0.1#{xray_build.DNS_INBOUND_PORT}")
     else:
+        # В умном режиме через VPN резолвятся только домены из списков
+        # (server=/…/ в proxy.conf), остальное — напрямую, без +300 мс на
+        # каждый промах кеша.
         for upstream in dns.get("upstream") or ["1.1.1.1"]:
             lines.append(f"server={upstream}")
+    if smart:
+        lines += [
+            "",
+            "# Умный прокси: домены, которые резолвятся через VPN и попадают в nft-сет.",
+            f"conf-file={proxylists.CONF_IN_CONTAINER}",
+        ]
 
     if dhcp.get("domain"):
         lines += [f"domain={dhcp['domain']}", "expand-hosts", "local=/%s/" % dhcp["domain"]]
@@ -148,10 +163,29 @@ def validate(cfg):
                 errors.append("начало пула DHCP больше его конца")
         except ValueError:
             pass
+        seen_macs, seen_ips = set(), set()
         for res in dhcp.get("reservations") or []:
+            mac = (res.get("mac") or "").strip().lower()
+            ip = (res.get("ip") or "").strip()
+            # Полностью пустая строка — просто заготовка из панели, не ругаемся.
+            if not mac and not ip:
+                continue
+            if not mac or not ip:
+                errors.append("резервация: нужны и MAC, и IP")
+                continue
+            if not _MAC_RE.match(mac):
+                errors.append(f"резервация {ip}: некорректный MAC «{mac}» (формат aa:bb:cc:dd:ee:ff)")
+                continue
             try:
-                if ipaddress.ip_address(res.get("ip", "")) not in network:
-                    errors.append(f"резервация {res.get('ip')} вне подсети {network}")
+                if ipaddress.ip_address(ip) not in network:
+                    errors.append(f"резервация {ip} вне подсети {network}")
             except ValueError:
-                errors.append(f"резервация: некорректный IP «{res.get('ip')}»")
+                errors.append(f"резервация: некорректный IP «{ip}»")
+                continue
+            if mac in seen_macs:
+                errors.append(f"резервация: MAC {mac} указан дважды")
+            seen_macs.add(mac)
+            if ip in seen_ips:
+                errors.append(f"резервация: IP {ip} закреплён за двумя устройствами")
+            seen_ips.add(ip)
     return errors

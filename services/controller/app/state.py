@@ -18,7 +18,7 @@ def _default_config():
     )
     hosts = list(lan_net.hosts())
     return {
-        "version": 1,
+        "version": 2,
         "vpn_enabled": False,
         "servers": [],
         "active_server": None,
@@ -29,6 +29,37 @@ def _default_config():
             "ips": [],
         },
         "force_proxy": {"geosite": [], "domains": [], "ips": []},
+        # Умный прокси: в xray заворачиваются только адреса заблокированных
+        # ресурсов, остальное идёт напрямую через ядро (см. proxylists.py).
+        "smart_proxy": {
+            "enabled": True,
+            "domain_lists": [
+                {"name": "itdoginfo: заблокированное в РФ", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-raw.lst"},
+            ],
+            "subnet_lists": [
+                {"name": "Telegram", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/telegram.lst"},
+                {"name": "Meta (Instagram, Facebook, WhatsApp)", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/meta.lst"},
+                {"name": "Twitter / X", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/twitter.lst"},
+                {"name": "Discord", "enabled": True,
+                 "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/discord.lst"},
+            ],
+            "auto_update_hours": 24,
+            # Клиентский DNS на чужие серверы (8.8.8.8 из DHCP и т.п.)
+            # заворачивается на dnsmasq: иначе сет не наполнится.
+            "hijack_dns": True,
+            # DNS-over-TLS мимо роутера: Android в режиме «автоматически»
+            # откатится на обычный DNS, если 853 отвечает отказом.
+            "block_dot": True,
+            # То же для DNS-over-HTTPS к известным резолверам (8.8.8.8, 1.1.1.1…):
+            # без этого Chrome/Windows/Android уходят на DoH, сет не наполняется,
+            # и YouTube идёт напрямую. Пусто в doh_servers — встроенный список.
+            "block_doh": True,
+            "doh_servers": [],
+        },
         "wan": {
             "interface": settings.DEFAULTS["wan_if"],
             "mode": "dhcp",
@@ -46,6 +77,9 @@ def _default_config():
             "interface": settings.DEFAULTS["lan_if"],
             "address": settings.DEFAULTS["lan_address"],
             "prefix": settings.DEFAULTS["lan_prefix"],
+            # Свободные порты плат с тремя и более ethernet: включённые сюда
+            # собираются в бридж с LAN-портом и работают как свич (см. netctl).
+            "switch_ports": [],
         },
         "dhcp": {
             "enabled": True,
@@ -115,7 +149,39 @@ def _default_config():
             "url": "https://speed.cloudflare.com/__down?bytes=50000000",
             "duration": 8,
         },
-        "block_quic": True,
+        # Туннель перестал отвечать — LAN временно идёт в интернет напрямую,
+        # пока нода или протокол не поднимутся (см. tunnel.py).
+        "failover": {
+            "enabled": True,
+            "interval": 3,
+            "timeout": 4,
+            "fail_threshold": 2,
+            "recover_threshold": 2,
+            "probe_urls": ["http://cp.cloudflare.com/generate_204",
+                           "http://www.gstatic.com/generate_204"],
+        },
+        # Свои VDS-ноды, развёрнутые из панели (см. nodes.py).
+        "nodes": [],
+        # Точка доступа на USB WiFi (hostapd, см. wifi.py): клиенты включаются
+        # в LAN-мост и живут по тем же правилам, что проводные.
+        "wifi": {
+            "enabled": False,
+            "ssid": "CircleRouter",
+            "password": "",
+            "band": "g",        # g = 2.4 ГГц, a = 5 ГГц (802.11ac)
+            "channel": 6,       # фиксированный: ACS у rtw88 не работает
+            "hidden": False,
+            "interface": "",    # пусто = первый wlan* интерфейс
+        },
+        # Оставлено для провайдеров, которые давят UDP/443: по умолчанию
+        # QUIC идёт в VPN, как и остальной UDP.
+        "block_quic": False,
+        # Заворачивать в туннель и трафик самого роутера (apt/docker/curl из
+        # консоли), а не только клиентов LAN — см. firewall.apply_tproxy.
+        "self_vpn": False,
+        # Торренты — в direct: сниффер bittorrent в xray опознаёт DHT/uTP,
+        # и правило маршрутизации уводит их из туннеля (см. xray_build).
+        "bypass_torrents": True,
         "log_level": "warning",
     }
 
@@ -130,8 +196,33 @@ def _deep_fill(target, template):
     return target
 
 
+def _migrate(cfg):
+    """Переводит старый router.json на текущие умолчания.
+
+    Миграций как таковых нет — только то, что нельзя выразить новым ключом.
+    До версии 2 весь UDP уходил напрямую, а QUIC/443 блокировался; теперь UDP
+    идёт через VPN. Старый `block_quic: true` иначе продолжал бы резать QUIC
+    и после обновления, хотя галки для него в панели нет.
+    """
+    try:
+        version = int(cfg.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version < 2:
+        cfg["block_quic"] = False
+        cfg["version"] = 2
+    return cfg
+
+
 def new_id():
     return uuid.uuid4().hex[:12]
+
+
+def normalize(cfg):
+    """Приводит сторонний словарь (файл, бэкап) к текущей схеме:
+    дописывает недостающие ключи из умолчаний и гонит миграции."""
+    _deep_fill(cfg, _default_config())
+    return _migrate(cfg)
 
 
 def load():
@@ -146,8 +237,7 @@ def load():
             cfg = {}
         if not isinstance(cfg, dict):
             cfg = {}
-        cfg = _deep_fill(cfg, _default_config())
-        return cfg
+        return normalize(cfg)
 
 
 def _write(cfg):

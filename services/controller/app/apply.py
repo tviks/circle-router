@@ -1,12 +1,11 @@
 """Приведение системы к состоянию, описанному в router.json."""
 
 import logging
-import socket
 import threading
 import time
 
 from . import (adblock, dnsmasq_cfg, dockerctl, firewall, netctl, pppoe,
-               settings, state, xray_build)
+               proxylists, settings, state, tunnel, wifi, xray_build)
 from .shell import run
 
 log = logging.getLogger("circle.apply")
@@ -49,17 +48,36 @@ def reconcile(restart_services=True):
         dhcp_problems = dnsmasq_cfg.validate(cfg)
         errors.extend(dhcp_problems)
         errors.extend(firewall.validate_forwards(cfg))
+        errors.extend(netctl.validate_lan(cfg))
+        errors.extend(wifi.validate(cfg))
+        errors.extend(xray_build.selfvpn_problems(cfg))
 
-        sysctls = netctl.prepare_host(cfg["lan"]["interface"], cfg["wan"]["interface"])
+        members = netctl.lan_members(cfg)
+        netctl.mark_unmanaged(members)
+        # Бридж собираем до sysctl: rp_filter выставляется и бриджу, а его
+        # путь в /proc/sys появляется только вместе с девайсом.
+        device = netctl.apply_bridge(cfg)
+        sysctls = netctl.prepare_host(device, cfg["wan"]["interface"], lan_ports=members)
         failed = [k for k, ok in sysctls.items() if not ok]
         if failed:
             errors.append("не удалось выставить sysctl: " + ", ".join(failed))
         steps.append("sysctl и модули ядра")
 
-        netctl.mark_unmanaged(cfg["lan"]["interface"])
-        address = netctl.configure_lan(cfg["lan"]["interface"], cfg["lan"]["address"],
+        address = netctl.configure_lan(device, cfg["lan"]["address"],
                                        cfg["lan"]["prefix"])
-        steps.append(f"LAN {cfg['lan']['interface']} -> {address}")
+        # Адрес мог остаться на физическом порту после перехода в свич (или
+        # наоборот, после отказа от свича в бридже) — сгоняем, иначе ARP flux.
+        netctl.prune_member_addresses(members, state.lan_network(cfg), keep=device)
+        steps.append(f"LAN {device} -> {address}")
+
+        # Точка доступа — после сборки бриджа (hostapd enslavит wlan сам, но
+        # бридж уже должен существовать) и до рестартов сервисов.
+        try:
+            message = wifi.apply(cfg)
+            if message:
+                steps.append(message)
+        except Exception as exc:                       # noqa: BLE001
+            errors.append(f"WiFi: {exc}")
 
         mode = cfg["wan"].get("mode", "dhcp")
         if mode == "pppoe":
@@ -121,6 +139,22 @@ def reconcile(restart_services=True):
             blocklist_changed = False
             errors.append(f"список блокировки: {exc}")
 
+        # Списки умного прокси — тоже из кеша; скачивает их proxylists.updater.
+        try:
+            proxy_changed, proxy_report = proxylists.build(cfg, download=False)
+            if proxy_report.get("disabled"):
+                steps.append("умный прокси выключен: в VPN идёт весь трафик")
+            else:
+                steps.append(f"умный прокси: {proxy_report['domains']} доменов, "
+                             f"{proxy_report['subnets']} подсетей")
+            for source in proxy_report.get("sources", []):
+                if not source.get("ok"):
+                    errors.append(f"список прокси «{source['name']}»: {source.get('error')}")
+        except Exception as exc:                       # noqa: BLE001
+            proxy_changed = False
+            errors.append(f"списки умного прокси: {exc}")
+        blocklist_changed = blocklist_changed or proxy_changed
+
         if dhcp_problems:
             # Писать конфиг с заведомо битым пулом нельзя: dnsmasq не стартует
             # и LAN останется без DHCP. Оставляем прошлый рабочий файл.
@@ -132,6 +166,7 @@ def reconcile(restart_services=True):
 
         if restart_services:
             ok, err = dockerctl.restart(settings.XRAY_CONTAINER)
+            tunnel.monitor.poke()
             steps.append("xray перезапущен" if ok else f"xray: {err}")
             if not ok:
                 errors.append(f"перезапуск xray: {err}")
@@ -151,16 +186,25 @@ def _finish(ok, steps, errors):
 
 
 def xray_listening(port):
-    """Дешёвая проба: TPROXY-инбаунд принимает соединения?"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.3)
-    try:
-        sock.connect(("127.0.0.1", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
+    """Дешёвая проба: TPROXY-инбаунд слушает порт?
+
+    Смотрим таблицу сокетов, а не подключаемся: connect() на dokodemo-door
+    с followRedirect xray принимает за петлю («loopback connection
+    detected») — раз в секунду в лог и лишнее соединение внутри xray.
+    """
+    wanted = f":{port:04X}"
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii") as fh:
+                next(fh, None)
+                for line in fh:
+                    fields = line.split()
+                    # fields[1] — local_address:port, fields[3] — состояние (0A = LISTEN).
+                    if len(fields) > 3 and fields[3] == "0A" and fields[1].endswith(wanted):
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 class Watchdog:
@@ -203,28 +247,54 @@ class Watchdog:
         tproxy = cfg["tproxy"]
         # Ориентируемся на то, что реально лежит в конфиге xray: при откате на
         # direct галка «VPN включён» ещё стоит, а заворачивать уже некуда.
-        want = (bool(cfg.get("vpn_enabled"))
-                and xray_build.effective()["vpn"]
-                and state.server_has_target(state.active_server(cfg))
-                and xray_listening(int(tproxy["port"])))
+        xray_ready = (bool(cfg.get("vpn_enabled"))
+                      and xray_build.effective()["vpn"]
+                      and state.server_has_target(state.active_server(cfg))
+                      and xray_listening(int(tproxy["port"])))
+        # xray жив, но сервер за ним молчит (нода перезагружается, протокол
+        # меняется, провайдер режет) — тоже уводим LAN напрямую, если это
+        # не запрещено в настройках.
+        failover = bool((cfg.get("failover") or {}).get("enabled", True))
         active = firewall.tproxy_active() and netctl.tproxy_routing_active(
             int(tproxy["fwmark"]), int(tproxy["table"]))
+        if not failover:
+            tunnel_ok = True
+        elif tunnel.monitor.state == "unknown":
+            # Первой пробы ещё не было (рестарт контроллера, смена сервера) —
+            # ничего не дёргаем. Иначе каждый перезапуск контроллера на десяток
+            # секунд отправлял LAN напрямую при живом туннеле. После рестарта
+            # xray TPROXY и так уже снят: он не слушал порт.
+            tunnel_ok = active
+        else:
+            tunnel_ok = tunnel.monitor.healthy()
+        want = xray_ready and tunnel_ok
 
         if want and not active:
             netctl.tproxy_routing_up(int(tproxy["fwmark"]), int(tproxy["table"]))
             firewall.apply_tproxy(cfg, True)
-            self._note("up", "xray поднялся — включаю TPROXY")
+            self._note("up", "туннель работает — включаю TPROXY")
         elif not want and active:
             firewall.apply_tproxy(cfg, False)
             netctl.tproxy_routing_down(int(tproxy["fwmark"]), int(tproxy["table"]))
-            self._note("down", "xray недоступен или VPN выключен — трафик напрямую")
+            if xray_ready:
+                self._note("failover", "туннель не отвечает — клиенты временно идут напрямую")
+            else:
+                self._note("down", "xray недоступен или VPN выключен — трафик напрямую")
+        elif not want and xray_ready and self.state != "failover":
+            self._note("failover", "туннель ещё не ответил — клиенты идут напрямую")
 
         # LAN-адрес мог снести networkd при событии на линке — возвращаем.
+        # В режиме свича адрес живёт на бридже; заодно доклеиваем порты,
+        # выпавшие из него (networkd и пересборка netplan'а любят это делать).
         lan = cfg["lan"]
+        device = netctl.lan_device(cfg)
+        if device == netctl.LAN_BRIDGE and not netctl.bridge_ok(cfg):
+            netctl.apply_bridge(cfg)
+            log.info("пересобрал бридж %s", device)
         wanted = f"{lan['address']}/{lan['prefix']}"
-        if wanted not in netctl.iface_addresses(lan["interface"]):
-            netctl.configure_lan(lan["interface"], lan["address"], lan["prefix"])
-            log.info("вернул адрес %s на %s", wanted, lan["interface"])
+        if wanted not in netctl.iface_addresses(device):
+            netctl.configure_lan(device, lan["address"], lan["prefix"])
+            log.info("вернул адрес %s на %s", wanted, device)
 
         # Перезапуск демона Docker пересоздаёт свои цепочки и вычищает наши
         # правила из DOCKER-USER — без них транзит мимо прокси снова умрёт.

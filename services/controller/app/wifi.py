@@ -1,0 +1,329 @@
+"""Точка доступа на USB WiFi: конфиг hostapd, запуск и присмотр за процессом.
+
+hostapd крутится прямо в контейнере контроллера — как pppd: контейнер живёт в
+host network namespace и privileged, поэтому nl80211 видит wlan-интерфейсы
+хоста. Сам интерфейс включается в LAN-мост (см. netctl.lan_members), так что
+wifi-клиенты получают DHCP, DNS и VPN-правила наравне с проводными.
+
+Адаптер RTL8811CU приезжает в режиме CD-ROM (0bda:1a2b) и переводится в WLAN
+(0bda:c811) правилом usb_modeswitch на хосте; имя wlan0 даёт systemd .link
+(/etc/systemd/network/10-circle-wlan.link, Driver=rtw88_8821cu). Контроллер
+этим не управляет — только пробует modprobe при отсутствии интерфейса и
+объясняет в статусе, чего не хватает.
+"""
+
+import logging
+import re
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from . import netctl
+from .shell import out
+
+log = logging.getLogger("circle.wifi")
+
+CONFIG_PATH = Path("/etc/hostapd/circle.conf")
+
+# Драйверы wifi: индеревной rtw88_8821cu подхватывает адаптер после
+# переключения из CD-ROM, rtl8xxxu — запасной для ревизий с ID 0bda:b711.
+# mac80211/cfg80211 подтянутся по зависимостям, modprobe просто молчит,
+# если что-то вкомпилировано в ядро.
+WIFI_MODULES = ["mac80211", "rtl8xxxu", "rtw88_8821cu"]
+
+_state = {
+    "process": None,
+    "thread": None,
+    "want": False,
+    # Поколение растёт на каждый start/stop — против дублей супервизоров
+    # (тот же приём, что в pppoe).
+    "generation": 0,
+    "last_error": "",
+    "restarts": 0,
+    "started_at": 0.0,
+}
+_lock = threading.Lock()
+
+
+# 5 ГГц без DFS: каналы 36–48 и 149–161, каждый — целиком свой блок 80 МГц.
+# 52–64 и 100+ требуют radar detection — точке доступа на rtw88 не даём.
+BAND_A_CHANNELS = (36, 40, 44, 48, 149, 153, 157, 161)
+# Центральная частота VHT80 для блока, в котором лежит канал.
+_VHT80_CENTER = {36: 42, 40: 42, 44: 42, 48: 42,
+                 149: 155, 153: 155, 157: 155, 161: 155}
+
+
+def _write_config(cfg):
+    """hostapd.conf. Значения пишутся как есть: парсер hostapd снимает
+    кавычки только у отдельных опций — у ssid= они становились частью
+    имени сети. '#' опасен лишь в начале строки (полнострочный комментарий),
+    внутри значения он безвреден. Возвращает True, если содержимое
+    изменилось (работающий hostapd надо перезапускать)."""
+    wifi = cfg["wifi"]
+    iface = (wifi.get("interface") or "").strip() or netctl.first_wlan()
+    lines = [
+        "# Сгенерировано circle-router",
+        f"interface={iface}",
+        # Точка доступа живёт в LAN-мосте (или на LAN-порте, если свич выключен):
+        # DHCP, DNS и TPROXY достаются wifi-клиентам без отдельных правил.
+        f"bridge={netctl.lan_device(cfg)}",
+        "driver=nl80211",
+        f"ssid={wifi.get('ssid', '')}",
+        "country_code=RU",
+        "ieee80211d=1",
+        "wmm_enabled=1",
+        "macaddr_acl=0",
+        "auth_algs=1",
+        "wpa=2",
+        "wpa_key_mgmt=WPA-PSK",
+        "rsn_pairwise=CCMP",
+        f"wpa_passphrase={wifi.get('password', '')}",
+    ]
+    if (wifi.get("band") or "g").lower() == "a":
+        # 5 ГГц: 802.11ac (VHT80) поверх HT40. ACS не используем и здесь —
+        # rtw88 его не тянет, канал фиксированный.
+        channel = int(wifi.get("channel") or 36)
+        if channel not in BAND_A_CHANNELS:
+            channel = 36
+        ht = "HT40+" if channel in (36, 40, 149, 153) else "HT40-"
+        lines += [
+            "hw_mode=a",
+            f"channel={channel}",
+            "ieee80211n=1",
+            f"ht_capab=[{ht}][SHORT-GI-20][SHORT-GI-40]",
+            "ieee80211ac=1",
+            "vht_oper_chwidth=1",
+            f"vht_oper_centr_freq_seg0_idx={_VHT80_CENTER[channel]}",
+        ]
+    else:
+        # 2.4 ГГц, HT20: донгл 1x1, HT40 на заглушённом эфире только мешает.
+        # channel=0 (hostapd ACS) rtw88 не тянет — «ACS: Failed to start», так
+        # что пустое значение тихо превращается в 6-й канал.
+        lines += [
+            "hw_mode=g",
+            f"channel={max(1, min(13, int(wifi.get('channel') or 6)))}",
+            "ieee80211n=1",
+        ]
+    if wifi.get("hidden"):
+        lines.append("ignore_broadcast_ssid=2")
+    text = "\n".join(lines) + "\n"
+    try:
+        changed = CONFIG_PATH.read_text(encoding="utf-8") != text
+    except OSError:
+        changed = True
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(text, encoding="utf-8")
+    return changed
+
+
+def _running_pids():
+    try:
+        proc = subprocess.run(["pgrep", "-f", f"hostapd {CONFIG_PATH}"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("pgrep недоступен: %s", exc)
+        return []
+    return [int(pid) for pid in proc.stdout.split() if pid.isdigit()]
+
+
+def _kill_strays():
+    """Добить hostapd прошлых запусков — только при остановке, как в pppoe."""
+    try:
+        subprocess.run(["pkill", "-f", f"hostapd {CONFIG_PATH}"],
+                       capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("pkill недоступен: %s", exc)
+
+
+def _supervise(generation):
+    """hostapd работает в foreground; если умер — поднимаем заново."""
+    while True:
+        with _lock:
+            if not _state["want"] or _state["generation"] != generation:
+                return
+        existing = _running_pids()
+        if existing:
+            log.info("hostapd уже работает (pid %s) — не поднимаю второй",
+                     ", ".join(map(str, existing)))
+            time.sleep(5)
+            continue
+        proc = subprocess.Popen(
+            ["hostapd", str(CONFIG_PATH)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        with _lock:
+            _state["process"] = proc
+            _state["started_at"] = time.time()
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            log.info("hostapd: %s", line)
+            low = line.lower()
+            if "could not" in low or "fail" in low or "error" in low:
+                with _lock:
+                    _state["last_error"] = line
+        proc.wait()
+        with _lock:
+            if _state["process"] is proc:
+                _state["process"] = None
+            if not _state["want"] or _state["generation"] != generation:
+                return
+            _state["restarts"] += 1
+            if not _state["last_error"]:
+                _state["last_error"] = f"hostapd завершился (код {proc.returncode})"
+        log.warning("hostapd завершился (код %s), перезапуск через 5 с", proc.returncode)
+        time.sleep(5)
+
+
+def start(cfg):
+    iface = (cfg["wifi"].get("interface") or "").strip() or netctl.first_wlan()
+    if not iface:
+        # Драйвер мог не загрузиться на этом проходе — пробуем ещё раз,
+        # прежде чем жаловаться. После usb_modeswitch интерфейс появляется
+        # сам, и следующий «Применить» (или watchdog) поднимет точку.
+        netctl.modprobe(WIFI_MODULES)
+        iface = netctl.first_wlan()
+    if not iface:
+        with _lock:
+            _state["last_error"] = ("wifi-адаптер не найден: нет wlan-интерфейса "
+                                    "(драйвер? usb_modeswitch?)")
+        log.warning("wifi: %s", _state["last_error"])
+        return
+    changed = _write_config(cfg)
+    if changed:
+        # hostapd конфиг при старте читает один раз: смена SSID/пароля/канала
+        # требует честного перезапуска, иначе точка продолжит жить по-старому.
+        log.info("wifi: конфиг изменился — перезапускаю hostapd")
+        stop()
+    with _lock:
+        alive = _state["thread"] is not None and _state["thread"].is_alive()
+        if _state["want"] and alive:
+            return
+        _state["want"] = True
+        _state["generation"] += 1
+        _state["last_error"] = ""
+        generation = _state["generation"]
+        thread = threading.Thread(target=_supervise, args=(generation,),
+                                  name=f"hostapd-{generation}", daemon=True)
+        _state["thread"] = thread
+    thread.start()
+
+
+def stop():
+    with _lock:
+        _state["want"] = False
+        _state["generation"] += 1
+        proc = _state["process"]
+    if proc and proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    _kill_strays()
+
+
+def apply(cfg):
+    """Из reconcile: поднимает/гасит точку по конфигу. Возвращает строку для
+    отчёта «Применить» или пустую строку, если сообщать нечего."""
+    if not (cfg.get("wifi") or {}).get("enabled"):
+        stop()
+        return ""
+    start(cfg)
+    iface = (cfg["wifi"].get("interface") or "").strip() or netctl.first_wlan()
+    if iface:
+        return f"WiFi: точка доступа на {iface}"
+    return "WiFi: адаптер не найден — точка доступа ждёт железо"
+
+
+def _stations(iface):
+    """Клиенты точки: `iw station dump` -> [{mac, signal, tx_bitrate}]."""
+    text = out(["iw", "dev", iface, "station", "dump"])
+    clients = []
+    for line in text.splitlines():
+        m = re.match(r"Station ([0-9a-f:]{17})\b", line)
+        if m:
+            clients.append({"mac": m.group(1), "signal": None, "tx_bitrate": None})
+            continue
+        if not clients:
+            continue
+        m = re.match(r"\s*signal:\s*(-?\d+)", line)
+        if m:
+            clients[-1]["signal"] = int(m.group(1))
+            continue
+        m = re.match(r"\s*tx bitrate:\s*([0-9.]+)", line)
+        if m:
+            clients[-1]["tx_bitrate"] = float(m.group(1))
+    return clients
+
+
+def status(cfg):
+    """Всё для карточки WiFi: адаптер, точка, канал, клиенты, подсказки."""
+    wifi = cfg.get("wifi") or {}
+    iface = (wifi.get("interface") or "").strip() or netctl.first_wlan()
+    with _lock:
+        proc = _state["process"]
+        running = bool(proc and proc.poll() is None)
+        info = {
+            "enabled": bool(wifi.get("enabled")),
+            "running": running,
+            "restarts": _state["restarts"],
+            "last_error": _state["last_error"],
+            "uptime": int(time.time() - _state["started_at"])
+            if running and _state["started_at"] else 0,
+            "interface": iface,
+            "clients": [],
+        }
+    # Адаптер ещё в режиме CD-ROM — драйвер его не видит до переключения.
+    info["cdrom_mode"] = "0bda:1a2b" in out(["lsusb"], default="")
+    if iface:
+        try:
+            phy = (Path(f"/sys/class/net/{iface}/phy80211/name")).read_text().strip()
+        except OSError:
+            phy = ""
+        phy_info = out(["iw", "phy", phy, "info"]) if phy else out(["iw", "phy"])
+        info["ap_supported"] = "* AP" in phy_info
+        dev_info = out(["iw", "dev", iface, "info"])
+        m = re.search(r"channel (\d+) \((\d+) MHz\)", dev_info)
+        info["channel"] = int(m.group(1)) if m else None
+        info["frequency"] = int(m.group(2)) if m else None
+        t = re.search(r"type (\w+)", dev_info)
+        info["ap_up"] = bool(t and t.group(1).startswith("AP"))
+        if running:
+            info["clients"] = _stations(iface)
+    else:
+        info["ap_supported"] = False
+        info["channel"] = None
+        info["frequency"] = None
+        info["ap_up"] = False
+    return info
+
+
+def validate(cfg):
+    """Претензии к секции wifi — человекочитаемые строки в отчёт «Применить»."""
+    wifi = cfg.get("wifi") or {}
+    problems = []
+    if not wifi.get("enabled"):
+        return problems
+    ssid = (wifi.get("ssid") or "").strip()
+    if not 1 <= len(ssid) <= 32:
+        problems.append("WiFi: имя сети (SSID) — от 1 до 32 символов")
+    psk = wifi.get("password") or ""
+    if not 8 <= len(psk) <= 63 or not psk.isascii():
+        problems.append("WiFi: пароль — от 8 до 63 ASCII-символов (WPA2)")
+    channel = int(wifi.get("channel") or 0)
+    if (wifi.get("band") or "g").lower() == "a":
+        if channel not in BAND_A_CHANNELS:
+            problems.append("WiFi: для 5 ГГц канал — 36/40/44/48 или 149/153/157/161 "
+                            "(без DFS)")
+    elif channel not in range(1, 14):
+        problems.append("WiFi: канал — число 1–13 (авто-выбор у rtw88 не работает)")
+    iface = (wifi.get("interface") or "").strip()
+    if iface and not re.match(r"^wlan\d{1,2}$", iface):
+        problems.append("WiFi: имя интерфейса — wlan<N> (или пусто для авто)")
+    return problems

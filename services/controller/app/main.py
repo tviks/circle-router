@@ -1,5 +1,6 @@
 """REST API и раздача веб-панели circle-router."""
 
+import json
 import logging
 import os
 import socket
@@ -12,8 +13,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (adblock, apply, auth, db, dnslog, dnsmasq_cfg, dockerctl,
-               firewall, geodat, netctl, pppoe, settings, speedtest, state,
-               stats, subscription, sysinfo, xray_build, xray_url)
+               firewall, geodat, netctl, node_monitor, nodes, pppoe, proxylists,
+               settings, speedtest, state, stats, subscription, sysinfo, tunnel,
+               wanspeed, wifi, xray_build, xray_url)
 
 logging.basicConfig(
     level=os.environ.get("CR_LOG_LEVEL", "INFO"),
@@ -28,7 +30,8 @@ app = FastAPI(title="circle-router", docs_url=None, redoc_url=None)
 # Ключи конфига, которые панель имеет право менять.
 EDITABLE = {"vpn_enabled", "bypass", "force_proxy", "wan", "lan", "dhcp", "dns",
             "tproxy", "firewall", "uplink_access", "port_forward", "adblock",
-            "speedtest", "block_quic", "log_level"}
+            "speedtest", "block_quic", "bypass_torrents", "log_level", "failover",
+            "wifi", "self_vpn"}
 
 
 # ── схемы запросов ───────────────────────────────────────────────────────────
@@ -62,6 +65,40 @@ class PasswordChangeRequest(BaseModel):
 
 class SpeedTestRequest(BaseModel):
     server_ids: list[str] | None = None
+
+
+class WanSpeedRequest(BaseModel):
+    paths: list[str] | None = None
+    duration: int = Field(default=10, ge=5, le=30)
+
+
+class NodeCreate(BaseModel):
+    name: str = Field(default="", max_length=60)
+    host: str = Field(max_length=255)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_user: str = Field(default="root", max_length=64)
+    password: str | None = None
+    private_key: str | None = None
+    key_passphrase: str | None = None
+    sni: list[str] = []
+    activate: bool = True
+    tune: dict | None = None
+
+
+class NodeUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=60)
+    sni: list[str] | None = None
+    tune: dict | None = None
+
+
+class NodeCredentials(BaseModel):
+    password: str | None = None
+    private_key: str | None = None
+    key_passphrase: str | None = None
+
+
+class NodeApplyRequest(BaseModel):
+    key: str | None = None
 
 
 # ── вспомогательное ──────────────────────────────────────────────────────────
@@ -153,18 +190,27 @@ def status(_: str = Depends(auth.require_user)):
             "routing_active": firewall.tproxy_active(),
             "xray_listening": apply.xray_listening(int(tproxy["port"])),
             "watchdog_state": apply.watchdog.state,
+            "failover_enabled": bool((cfg.get("failover") or {}).get("enabled", True)),
+            "tunnel": tunnel.monitor.snapshot(),
             "active_server": {"id": server.get("id"), "name": server.get("name")}
             if server else None,
         },
         "wan": _wan_snapshot(cfg),
         "lan": {
             "interface": cfg["lan"]["interface"],
+            # device — бридж, когда свич-порты включены: на нём адрес и dnsmasq.
+            "device": netctl.lan_device(cfg),
+            "switch_ports": list(cfg["lan"].get("switch_ports") or []),
+            "members": netctl.lan_members(cfg),
+            "bridge_members": netctl.bridge_members(),
             "address": cfg["lan"]["address"],
             "prefix": cfg["lan"]["prefix"],
             "network": str(state.lan_network(cfg)),
-            "link": netctl.link_state(cfg["lan"]["interface"]),
-            "carrier": netctl.has_carrier(cfg["lan"]["interface"]),
-            "addresses": netctl.iface_addresses(cfg["lan"]["interface"]),
+            "link": netctl.link_state(netctl.lan_device(cfg)),
+            # У бриджа нет собственного «кабеля»: считаемся живым, если линк
+            # есть хотя бы на одном порту-члене.
+            "carrier": any(netctl.has_carrier(p) for p in netctl.lan_members(cfg)),
+            "addresses": netctl.iface_addresses(netctl.lan_device(cfg)),
         },
         "dhcp": {"enabled": cfg["dhcp"].get("enabled", True),
                  "leases": len(dnsmasq_cfg.leases())},
@@ -179,6 +225,13 @@ def status(_: str = Depends(auth.require_user)):
                    "networks": firewall.uplink_networks(cfg)},
         "services": _service_status(),
         "pppoe": pppoe.status() if cfg["wan"].get("mode") == "pppoe" else None,
+        # Заворот собственного трафика роутера в туннель: желаемое и то,
+        # что реально наложено nft'ами (снят при failover вместе с TPROXY).
+        "self_vpn": {
+            "enabled": bool(cfg.get("self_vpn")),
+            "active": firewall.self_vpn_active(),
+        },
+        "wifi": wifi.status(cfg),
         "host": {
             "uptime": netctl.host_uptime(),
             "loadavg": netctl.loadavg(),
@@ -202,6 +255,12 @@ def api_interfaces(_: str = Depends(auth.require_user)):
     return netctl.interfaces()
 
 
+@app.get("/api/wifi")
+def api_wifi(_: str = Depends(auth.require_user)):
+    """Живой статус точки доступа: адаптер, hostapd, канал, клиенты."""
+    return wifi.status(state.load())
+
+
 # ── конфигурация ─────────────────────────────────────────────────────────────
 
 @app.get("/api/config")
@@ -212,6 +271,11 @@ def get_config(_: str = Depends(auth.require_user)):
     safe["wan"] = dict(cfg["wan"])
     safe["wan"]["pppoe"] = dict(cfg["wan"]["pppoe"])
     safe["wan"]["pppoe"]["password"] = "••••••" if cfg["wan"]["pppoe"].get("password") else ""
+    # То же для пароля WiFi-точки.
+    safe["wifi"] = dict(cfg.get("wifi") or {})
+    safe["wifi"]["password"] = "••••••" if safe["wifi"].get("password") else ""
+    # Ноды живут в своём API: в них ключи Reality и сертификаты.
+    safe.pop("nodes", None)
     return safe
 
 
@@ -227,15 +291,71 @@ def post_config(patch: dict, _: str = Depends(auth.require_user)):
         # Маскированный пароль из GET /api/config не должен затирать настоящий.
         if not str(pppoe_patch.get("password") or "").strip("•"):
             pppoe_patch.pop("password", None)
+        wifi_patch = (patch.get("wifi") or {})
+        if not str(wifi_patch.get("password") or "").strip("•"):
+            wifi_patch.pop("password", None)
         _merge(cfg, patch)
 
     cfg = state.update(mutate)
-    problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg)
+    problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg) \
+        + netctl.validate_lan(cfg) + wifi.validate(cfg) \
+        + xray_build.selfvpn_problems(cfg)
     return {"ok": not problems, "problems": problems, "config": get_config()}
 
 
 @app.post("/api/apply")
 def post_apply(_: str = Depends(auth.require_user)):
+    result = apply.reconcile()
+    if not result.get("ok"):
+        return JSONResponse(status_code=422, content=result)
+    return result
+
+
+# ── резервная копия конфигурации ─────────────────────────────────────────────
+# router.json — единственный источник правды: dnsmasq.conf, xray-конфиг и
+# nftables генерируются из него при каждом «Применить». Поэтому бэкап — это
+# сам router.json целиком, включая секреты (пароль PPPoE, ключи нод, ссылки
+# серверов), которые GET /api/config вырезает. Файл равнозначен паролю панели.
+
+BACKUP_KIND = "circle-router-backup"
+
+
+@app.get("/api/backup")
+def get_backup(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    payload = {
+        "kind": BACKUP_KIND,
+        "version": cfg.get("version"),
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "config": cfg,
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    filename = f"circle-router-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/restore")
+def post_restore(payload: dict, _: str = Depends(auth.require_user)):
+    if payload.get("kind") != BACKUP_KIND or not isinstance(payload.get("config"), dict):
+        return {"ok": False, "problems": ["это не файл резервной копии circle-router"]}
+
+    # Конфиг мог быть снят со старой версии — дописываем ключи, которых ещё
+    # не было, и прогоняем миграции, как при обычном чтении.
+    restored = state.normalize(payload["config"])
+    problems = dnsmasq_cfg.validate(restored) + firewall.validate_forwards(restored) \
+        + netctl.validate_lan(restored) + wifi.validate(restored)
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    def mutate(cfg):
+        cfg.clear()
+        cfg.update(restored)
+
+    state.update(mutate)
     result = apply.reconcile()
     if not result.get("ok"):
         return JSONResponse(status_code=422, content=result)
@@ -342,9 +462,14 @@ def test_server(server_id: str, _: str = Depends(auth.require_user)):
     if not server:
         raise HTTPException(status_code=404, detail="сервер не найден")
     try:
-        host, port = xray_url.endpoint(xray_build.outbound_for(server))
+        outbound = xray_build.outbound_for(server)
+        host, port = xray_url.endpoint(outbound)
     except Exception as exc:                           # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"не разобрал сервер: {exc}")
+    if outbound.get("protocol") in ("hysteria", "wireguard"):
+        return {"ok": False,
+                "error": "UDP-протокол: TCP-проба неприменима, используйте замер скорости",
+                "host": host, "port": port}
 
     started = time.perf_counter()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -395,6 +520,159 @@ def import_servers(payload: ImportRequest, _: str = Depends(auth.require_user)):
 
     cfg = state.update(mutate)
     return {"ok": True, "imported": len(servers), "total": len(cfg["servers"])}
+
+
+# ── свои ноды ────────────────────────────────────────────────────────────────
+
+def _node_or_404(node_id):
+    try:
+        return nodes.get(node_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="нода не найдена")
+
+
+def _start_job(node_id, kind, **kwargs):
+    try:
+        return nodes.start(node_id, kind, **kwargs)
+    except nodes.JobBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _clean_sni(values):
+    result = []
+    for value in values or []:
+        value = value.strip().lower()
+        if not value:
+            continue
+        if any(ch in value for ch in " /:") or "." not in value:
+            raise HTTPException(status_code=400, detail=f"не похоже на домен: {value}")
+        if "apple" in value or "icloud" in value:
+            raise HTTPException(status_code=400,
+                                detail="apple/icloud в Reality ядро не любит, такие SNI банят первыми")
+        if value not in result:
+            result.append(value)
+    return result
+
+
+@app.get("/api/nodes")
+def list_nodes(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    result = []
+    for node in cfg.get("nodes") or []:
+        item = nodes.public(node, cfg)
+        item["metrics"], _history = node_monitor.monitor.snapshot(node["id"])
+        result.append(item)
+    return {"nodes": result, "busy": nodes.any_running()}
+
+
+@app.post("/api/nodes")
+def create_node(payload: NodeCreate, _: str = Depends(auth.require_user)):
+    host = payload.host.strip()
+    if not host or any(ch in host for ch in " /@"):
+        raise HTTPException(status_code=400, detail="укажите IP или имя сервера")
+    if not (payload.password or payload.private_key):
+        raise HTTPException(status_code=400, detail="нужен пароль или приватный ключ")
+    if nodes.any_running():
+        raise HTTPException(status_code=409, detail="дождитесь окончания текущей задачи")
+    node = nodes.create({
+        "name": payload.name.strip() or host, "host": host,
+        "ssh_port": payload.ssh_port, "ssh_user": payload.ssh_user.strip() or "root",
+        "sni": _clean_sni(payload.sni), "activate": payload.activate,
+        "tune": {k: v for k, v in (payload.tune or {}).items() if k in nodes.DEFAULT_TUNE},
+    })
+    _start_job(node["id"], "deploy", password=payload.password,
+               private_key=payload.private_key, key_passphrase=payload.key_passphrase)
+    return {"ok": True, "node": nodes.public(node, state.load())}
+
+
+@app.put("/api/nodes/{node_id}")
+def edit_node(node_id: str, payload: NodeUpdate, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    sni = _clean_sni(payload.sni) if payload.sni is not None else None
+
+    def mutate(node, cfg):
+        if payload.name is not None and payload.name.strip():
+            node["name"] = payload.name.strip()
+            server = next((s for s in cfg["servers"] if s["id"] == node.get("server_id")), None)
+            if server and node.get("profile"):
+                label = nodes.nb.TRANSPORTS[node["profile"]["transport"]]["label"]
+                server["name"] = f"{node['name']} · {label}"
+        if sni is not None:
+            node["sni"] = sni
+        if payload.tune:
+            tune = {**nodes.DEFAULT_TUNE, **(node.get("tune") or {})}
+            for key, value in payload.tune.items():
+                if key in nodes.DEFAULT_TUNE:
+                    tune[key] = value
+            tune["interval_hours"] = min(max(float(tune["interval_hours"]), 1), 168)
+            tune["speed_seconds"] = min(max(int(tune["speed_seconds"]), 3), 15)
+            tune["improve_pct"] = min(max(float(tune["improve_pct"]), 5), 200)
+            node["tune"] = tune
+
+    node = nodes.update(node_id, mutate)
+    return {"ok": True, "node": nodes.public(node, state.load())}
+
+
+@app.post("/api/nodes/{node_id}/deploy")
+def redeploy_node(node_id: str, payload: NodeCredentials,
+                  _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "deploy", password=payload.password,
+                                          private_key=payload.private_key,
+                                          key_passphrase=payload.key_passphrase)}
+
+
+@app.post("/api/nodes/{node_id}/tune")
+def tune_node(node_id: str, _: str = Depends(auth.require_user)):
+    node = _node_or_404(node_id)
+    if node.get("status") != "ready":
+        raise HTTPException(status_code=400, detail="нода ещё не развёрнута")
+    return {"ok": True, "job": _start_job(node_id, "tune")}
+
+
+@app.post("/api/nodes/{node_id}/apply")
+def apply_node_profile(node_id: str, payload: NodeApplyRequest,
+                       _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "apply", key=payload.key)}
+
+
+@app.post("/api/nodes/{node_id}/restart")
+def restart_node(node_id: str, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "restart")}
+
+
+@app.post("/api/nodes/{node_id}/forget-host-key")
+def forget_host_key(node_id: str, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    nodes.update(node_id, lambda n, _: n.update({"host_key": None}))
+    return {"ok": True}
+
+
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str, wipe: bool = True, _: str = Depends(auth.require_user)):
+    _node_or_404(node_id)
+    return {"ok": True, "job": _start_job(node_id, "uninstall", wipe=wipe)}
+
+
+@app.get("/api/nodes/{node_id}/metrics")
+def node_metrics(node_id: str, _: str = Depends(auth.require_user)):
+    node = _node_or_404(node_id)
+    cfg = state.load()
+    latest, history = node_monitor.monitor.snapshot(node_id)
+    active = bool(node.get("server_id")) and cfg.get("active_server") == node["server_id"]
+    link = stats.sampler.snapshot(150) if active else []
+    return {
+        "latest": latest,
+        "history": history,
+        "active": active,
+        "tunnel": tunnel.monitor.snapshot() if active else None,
+        "tunnel_series": tunnel.monitor.series() if active else [],
+        "throughput": [{"ts": p["ts"], "down": p.get("proxy_down_rate", 0),
+                        "up": p.get("proxy_up_rate", 0)} for p in link
+                       if "proxy_down_rate" in p],
+    }
 
 
 # ── клиенты и метрики ────────────────────────────────────────────────────────
@@ -467,6 +745,35 @@ def adblock_update(_: str = Depends(auth.require_user)):
     return {"ok": True, "restarted": changed, **report}
 
 
+def _proxylists_changed(changed):
+    """Новые списки: статические подсети — в nft, домены — в dnsmasq."""
+    cfg = state.load()
+    if firewall.tproxy_active():
+        firewall.apply_tproxy(cfg, True)
+    if changed:
+        dockerctl.restart(settings.DNSMASQ_CONTAINER)
+
+
+@app.get("/api/smart-proxy")
+def smart_proxy_status(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    return {"config": cfg.get("smart_proxy"), "enabled": proxylists.enabled(cfg),
+            "status": proxylists.status()}
+
+
+@app.post("/api/smart-proxy/update")
+def smart_proxy_update(_: str = Depends(auth.require_user)):
+    cfg = state.load()
+    try:
+        changed, report = proxylists.update(cfg)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:                           # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc))
+    _proxylists_changed(changed)
+    return {"ok": True, "restarted": changed, **report}
+
+
 @app.post("/api/adblock/reset-stats")
 def adblock_reset_stats(_: str = Depends(auth.require_user)):
     dnslog.reader.reset()
@@ -490,6 +797,23 @@ def speedtest_start(payload: SpeedTestRequest, _: str = Depends(auth.require_use
         raise HTTPException(status_code=400, detail="нечего проверять")
     try:
         return speedtest.start(targets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ── общий спидтест канала ────────────────────────────────────────────────────
+
+@app.get("/api/wanspeed")
+def wanspeed_status(_: str = Depends(auth.require_user)):
+    return wanspeed.status()
+
+
+@app.post("/api/wanspeed")
+def wanspeed_start(payload: WanSpeedRequest, _: str = Depends(auth.require_user)):
+    try:
+        return wanspeed.start(payload.paths, payload.duration)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -552,17 +876,25 @@ def on_startup():
     except Exception:                                  # noqa: BLE001
         log.exception("первичное применение конфигурации не удалось")
     stats.sampler.start()
+    tunnel.monitor.start()
     apply.watchdog.start()
+    node_monitor.monitor.start()
+    nodes.advisor.start()
     dnslog.reader.start()
     adblock.updater.start(on_change=lambda: dockerctl.restart(settings.DNSMASQ_CONTAINER))
+    proxylists.updater.start(on_change=_proxylists_changed)
 
 
 @app.on_event("shutdown")
 def on_shutdown():
     apply.watchdog.stop()
+    tunnel.monitor.stop()
+    node_monitor.monitor.stop()
+    nodes.advisor.stop()
     stats.sampler.stop()
     dnslog.reader.stop()
     adblock.updater.stop()
+    proxylists.updater.stop()
 
 
 @app.get("/healthz")

@@ -21,6 +21,10 @@ const WAN_MODES = [
   ['static', 'Статический адрес'],
 ]
 
+// Имя моста, который контроллер собирает из LAN-порта и свич-портов
+// (см. netctl.LAN_BRIDGE). Дублируем константу: фронт не ходит в Python.
+const LAN_BRIDGE = 'br-lan'
+
 export default function Network({ status, refreshStatus }) {
   const toast = useToast()
   const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
@@ -71,7 +75,30 @@ export default function Network({ status, refreshStatus }) {
     }
   }
 
-  const ifaceOptions = (interfaces ?? []).map((i) => i.name)
+  // br-lan из выбора портов исключён: это наш мост, он создаётся сам.
+  const ifaceOptions = (interfaces ?? []).map((i) => i.name).filter((n) => n !== LAN_BRIDGE)
+
+  // Режим свича имеет смысл только на платах с тремя и более ethernet:
+  // свободные порты (не WAN, не LAN, не наш мост и не ppp-сессии) можно
+  // включить в LAN. Порты из конфига, которых сейчас нет в системе (выдернутый
+  // USB-адаптер), тоже показываем — иначе их нельзя было бы выключить.
+  const switchPorts = draft.lan.switch_ports ?? []
+  const knownNames = new Set((interfaces ?? []).map((i) => i.name))
+  const switchCandidates = [
+    ...(interfaces ?? []),
+    ...switchPorts
+      .filter((p) => !knownNames.has(p))
+      .map((name) => ({ name, carrier: false })),
+  ].filter(
+    (i) =>
+      i.name !== draft.wan.interface &&
+      i.name !== draft.lan.interface &&
+      i.name !== LAN_BRIDGE &&
+      !/^ppp/.test(i.name)
+  )
+  const lanDevice = switchPorts.length ? LAN_BRIDGE : draft.lan.interface
+  const toggleSwitchPort = (name, on) =>
+    set('lan.switch_ports', on ? [...switchPorts, name] : switchPorts.filter((p) => p !== name))
 
   return (
     <div className="space-y-5">
@@ -109,7 +136,11 @@ export default function Network({ status, refreshStatus }) {
               </span>
               <span className="mono ml-auto text-xs text-slate-700">{iface.mac}</span>
               {iface.name === draft.wan.interface && <Chip tone="info">WAN</Chip>}
+              {iface.name === LAN_BRIDGE && switchPorts.length > 0 && (
+                <Chip tone="ok">LAN (мост)</Chip>
+              )}
               {iface.name === draft.lan.interface && <Chip tone="ok">LAN</Chip>}
+              {switchPorts.includes(iface.name) && <Chip tone="ok">свич</Chip>}
             </li>
           ))}
         </ul>
@@ -255,6 +286,31 @@ export default function Network({ status, refreshStatus }) {
                 ))}
               </Select>
             </Field>
+
+            {switchCandidates.length > 0 && (
+              <div className="space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
+                <p className="text-xs text-slate-500">
+                  Свободные порты можно включить в LAN как свич: воткнутое в них
+                  устройство окажется в той же сети и получит адрес по DHCP.
+                </p>
+                {switchCandidates.map((iface) => (
+                  <Toggle
+                    key={iface.name}
+                    checked={switchPorts.includes(iface.name)}
+                    onChange={(v) => toggleSwitchPort(iface.name, v)}
+                    label={iface.name}
+                    description={iface.carrier ? 'кабель подключён' : 'нет кабеля'}
+                  />
+                ))}
+                {switchPorts.length > 0 && (
+                  <p className="text-xs text-amber-200/80">
+                    При сохранении адрес LAN переедет на мост{' '}
+                    <span className="mono">{LAN_BRIDGE}</span> — связь на пару секунд
+                    прервётся, DHCP и правила фаервола продолжат работать как раньше.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Адрес роутера">
                 <Input
@@ -655,6 +711,9 @@ function PortForward({ section, onChange, lanNetwork, wanAddress }) {
 }
 
 function Reservations({ items, onChange }) {
+  // Подсказки из живых аренд: удобнее выбрать MAC/IP устройства, чем копировать
+  // их со страницы «Клиенты» (или с наклейки под роутером).
+  const { data: clients } = usePoll(api.clients, 20000)
   const rows = items ?? []
   const update = (index, key, value) => {
     const next = rows.map((row, i) => (i === index ? { ...row, [key]: value } : row))
@@ -675,6 +734,21 @@ function Reservations({ items, onChange }) {
       }
       bodyClass={rows.length ? 'card-pad' : 'p-0'}
     >
+      <datalist id="reservation-macs">
+        {(clients ?? []).filter((c) => c.mac).map((c) => (
+          <option key={c.mac} value={c.mac}>
+            {c.hostname || c.ip}
+          </option>
+        ))}
+      </datalist>
+      <datalist id="reservation-ips">
+        {(clients ?? []).filter((c) => c.mac).map((c) => (
+          <option key={c.ip} value={c.ip}>
+            {c.hostname || c.mac}
+          </option>
+        ))}
+      </datalist>
+
       {rows.length === 0 ? (
         <p className="px-6 py-8 text-center text-sm text-slate-600">Резерваций нет.</p>
       ) : (
@@ -682,11 +756,13 @@ function Reservations({ items, onChange }) {
           {rows.map((row, index) => (
             <div key={index} className="grid gap-3 sm:grid-cols-[1.2fr_1fr_1fr_auto]">
               <Input
+                list="reservation-macs"
                 value={row.mac}
                 onChange={(e) => update(index, 'mac', e.target.value)}
                 placeholder="aa:bb:cc:dd:ee:ff"
               />
               <Input
+                list="reservation-ips"
                 value={row.ip}
                 onChange={(e) => update(index, 'ip', e.target.value)}
                 placeholder="192.168.10.50"

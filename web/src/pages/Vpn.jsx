@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   Download,
   Gauge,
+  LifeBuoy,
   Pencil,
   Plus,
   ServerCog,
@@ -12,6 +13,7 @@ import {
 
 import { api } from '../lib/api'
 import { useConfigDraft, usePoll } from '../lib/hooks'
+import { dateLabel } from '../lib/format'
 import {
   Card,
   Chip,
@@ -21,12 +23,14 @@ import {
   Modal,
   Spinner,
   TagList,
+  Toggle,
   useToast,
 } from '../components/ui'
+import { TunnelChip } from './Nodes'
 
 const EMPTY_SERVER = { name: '', url: '' }
 
-export default function Vpn({ refreshStatus }) {
+export default function Vpn({ status, refreshStatus }) {
   const toast = useToast()
   const { data, refresh } = usePoll(api.servers, 15000)
   const [editing, setEditing] = useState(null)
@@ -137,7 +141,7 @@ export default function Vpn({ refreshStatus }) {
           <Empty
             icon={ServerCog}
             title="Серверов пока нет"
-            hint="Добавьте ссылку vless:// / vmess:// / trojan:// / ss:// или импортируйте подписку."
+            hint="Добавьте ссылку vless:// / vmess:// / trojan:// / ss:// / wireguard:// (или конфиг WireGuard) либо импортируйте подписку."
           />
         ) : (
           <ul className="divide-y divide-white/[0.06]">
@@ -163,7 +167,9 @@ export default function Vpn({ refreshStatus }) {
         )}
       </Card>
 
-      <RoutingRules />
+      <FailoverCard status={status} />
+
+      <RoutingRules status={status} refreshStatus={refreshStatus} />
 
       <ServerModal
         server={editing}
@@ -222,7 +228,11 @@ function ServerRow({
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium text-slate-100">{server.name}</span>
             {!server.valid && <Chip tone="bad">ошибка разбора</Chip>}
-            {server.outbound && !server.url && <Chip tone="info">Xray JSON</Chip>}
+            {server.node_id ? (
+              <Chip tone="info">своя нода</Chip>
+            ) : (
+              server.outbound && !server.url && <Chip tone="info">Xray JSON</Chip>
+            )}
           </div>
           <div className="mono mt-0.5 truncate text-xs text-slate-500">
             {summary.address
@@ -399,15 +409,15 @@ function ServerModal({ server, onClose, onSaved }) {
           />
         </Field>
         <Field
-          label="Ссылка"
-          hint="vless:// · vmess:// · trojan:// · ss://"
+          label="Ссылка или конфиг WireGuard"
+          hint="vless:// · vmess:// · trojan:// · ss:// · wireguard:// · [Interface]/[Peer]"
           error={preview && !preview.ok ? preview.error : ''}
         >
           <textarea
             className="input min-h-[100px] font-mono text-xs"
             value={form.url}
             onChange={(e) => setForm({ ...form, url: e.target.value })}
-            placeholder="vless://uuid@host:443?type=tcp&security=reality&…"
+            placeholder="vless://uuid@host:443?type=tcp&security=reality&…&#10;[Interface]&#10;PrivateKey = …&#10;[Peer]&#10;Endpoint = host:51820"
           />
         </Field>
         {preview?.ok && (
@@ -494,7 +504,7 @@ function ImportModal({ open, onClose, onDone }) {
   )
 }
 
-function RoutingRules() {
+function RoutingRules({ status, refreshStatus }) {
   const toast = useToast()
   const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
   const { data: geo } = usePoll(api.geoCategories, 600000)
@@ -506,16 +516,21 @@ function RoutingRules() {
   const save = useCallback(async () => {
     setBusy(true)
     try {
-      await api.patchConfig({ bypass: draft.bypass, force_proxy: draft.force_proxy })
+      await api.patchConfig({
+        bypass: draft.bypass,
+        force_proxy: draft.force_proxy,
+        bypass_torrents: Boolean(draft.bypass_torrents),
+        self_vpn: Boolean(draft.self_vpn),
+      })
       await api.apply()
       toast('Правила маршрутизации применены', 'ok')
-      await settle()
+      await Promise.all([settle(), refreshStatus?.()])
     } catch (err) {
       toast(err.message, 'bad', 9000)
     } finally {
       setBusy(false)
     }
-  }, [draft, settle, toast])
+  }, [draft, settle, toast, refreshStatus])
 
   if (!draft) return null
 
@@ -545,6 +560,35 @@ function RoutingRules() {
           <option key={c} value={c} />
         ))}
       </datalist>
+
+      <div className="mb-6 space-y-4 border-b border-white/[0.06] pb-6">
+        <Toggle
+          checked={Boolean(draft.bypass_torrents)}
+          onChange={(v) => edit((d) => ({ ...d, bypass_torrents: v }))}
+          label="Торренты мимо VPN"
+          description="xray опознаёт DHT и uTP по содержимому, а не по портам — раздачи идут напрямую, остальное как обычно"
+        />
+        <Toggle
+          checked={Boolean(draft.self_vpn)}
+          onChange={(v) => edit((d) => ({ ...d, self_vpn: v }))}
+          label="Трафик самого роутера через VPN"
+          description={
+            'apt, docker pull и curl из консоли платы уйдут в туннель, как у клиентов LAN. ' +
+            'При падении туннеля watchdog снимает заворот — консоль остаётся с прямым интернетом. ' +
+            'Общий спидтест «напрямую» в этом режиме меряет через VPN.'
+          }
+        />
+        {status?.self_vpn && (
+          <p className="-mt-1 text-xs text-slate-500">
+            Сейчас:{' '}
+            {status.self_vpn.enabled
+              ? status.self_vpn.active
+                ? <span className="text-emerald-300">заворот активен</span>
+                : <span className="text-amber-300">включён, ждёт туннель</span>
+              : 'выключен'}
+          </p>
+        )}
+      </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
         <div className="space-y-4">
@@ -605,6 +649,114 @@ function RoutingRules() {
               placeholder="1.1.1.1/32"
             />
           </Field>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+function FailoverCard({ status }) {
+  const toast = useToast()
+  const { draft, edit, dirty, settle } = useConfigDraft(api.getConfig)
+  const [busy, setBusy] = useState(false)
+  const tunnel = status?.vpn?.tunnel
+
+  const save = useCallback(async () => {
+    setBusy(true)
+    try {
+      const failover = {
+        ...draft.failover,
+        interval: Number(draft.failover.interval),
+        timeout: Number(draft.failover.timeout),
+        fail_threshold: Number(draft.failover.fail_threshold),
+        recover_threshold: Number(draft.failover.recover_threshold),
+      }
+      await api.patchConfig({ failover })
+      toast('Настройки обхода сохранены', 'ok')
+      await settle()
+    } catch (err) {
+      toast(err.message, 'bad', 9000)
+    } finally {
+      setBusy(false)
+    }
+  }, [draft, settle, toast])
+
+  if (!draft?.failover) return null
+  const fo = draft.failover
+  const set = (patch) => edit((d) => ({ ...d, failover: { ...d.failover, ...patch } }))
+  const events = [...(tunnel?.events ?? [])].reverse().slice(0, 6)
+  const detect = Math.round(fo.fail_threshold * (Number(fo.interval) + Number(fo.timeout)))
+
+  return (
+    <Card
+      title="Если туннель упал"
+      subtitle="xray жив, а сервер молчит — клиенты временно идут в интернет напрямую"
+      actions={
+        <>
+          <TunnelChip tunnel={tunnel} />
+          {dirty && <Chip tone="warn">не сохранено</Chip>}
+          <button className="btn-primary" onClick={save} disabled={busy || !dirty}>
+            {busy && <Spinner />} Сохранить
+          </button>
+        </>
+      }
+    >
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="space-y-4">
+          <Toggle
+            checked={fo.enabled}
+            onChange={(v) => set({ enabled: v })}
+            label="Переключать клиентов на прямой интернет"
+            description={
+              fo.enabled
+                ? `потеря туннеля замечается примерно за ${detect} с, возврат — после ${fo.recover_threshold} удачных проверок`
+                : 'выключено: при обрыве туннеля LAN останется без интернета (kill switch)'
+            }
+          />
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <Field label="Проверка, с">
+              <Input type="number" min={1} max={30} value={fo.interval} onChange={(e) => set({ interval: e.target.value })} />
+            </Field>
+            <Field label="Таймаут, с">
+              <Input type="number" min={1} max={15} value={fo.timeout} onChange={(e) => set({ timeout: e.target.value })} />
+            </Field>
+            <Field label="Провалов">
+              <Input type="number" min={1} max={10} value={fo.fail_threshold} onChange={(e) => set({ fail_threshold: e.target.value })} />
+            </Field>
+            <Field label="Успехов">
+              <Input type="number" min={1} max={10} value={fo.recover_threshold} onChange={(e) => set({ recover_threshold: e.target.value })} />
+            </Field>
+          </div>
+          <Field label="Адреса проверки" hint="запрос идёт через туннель; хватает ответа любого из первых двух">
+            <TagList values={fo.probe_urls} onChange={(v) => set({ probe_urls: v })} placeholder="http://cp.cloudflare.com/generate_204" />
+          </Field>
+        </div>
+
+        <div>
+          <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-slate-500">
+            <LifeBuoy size={13} /> Последние переключения
+          </div>
+          {events.length === 0 ? (
+            <p className="text-sm text-slate-600">Обрывов не было.</p>
+          ) : (
+            <ul className="space-y-2 text-xs">
+              {events.map((e) => (
+                <li key={`${e.ts}-${e.state}`} className="flex items-center gap-2">
+                  <span className="mono text-slate-600">{dateLabel(e.ts)}</span>
+                  <Chip tone={e.state === 'down' ? 'bad' : 'ok'}>
+                    {e.state === 'down' ? 'напрямую' : 'VPN вернулся'}
+                  </Chip>
+                  {e.error && <span className="truncate text-slate-500">{e.error}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {tunnel?.failovers_hour > 0 && (
+            <p className="mt-3 text-xs text-slate-500">
+              За последний час: {tunnel.failovers_hour}. Своя нода после трёх обрывов за час
+              перепроверит протоколы сама.
+            </p>
+          )}
         </div>
       </div>
     </Card>

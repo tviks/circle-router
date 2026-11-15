@@ -118,3 +118,42 @@ export function HistoryChart({ points, height = 240 }) {
     </div>
   )
 }
+
+/** Маленький график без осей — для карточек нод. */
+export function Sparkline({ data, dataKey, color = '#38bdf8', formatter = (v) => v, height = 44, name }) {
+  const points = (data ?? []).filter((p) => p[dataKey] !== null && p[dataKey] !== undefined)
+  const id = `spark-${dataKey}-${color.replace('#', '')}`
+  if (points.length < 2) {
+    return <div style={{ height }} className="flex items-center text-[11px] text-slate-700">копим данные…</div>
+  }
+  return (
+    <div style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={points} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity={0.35} />
+              <stop offset="100%" stopColor={color} stopOpacity={0.02} />
+            </linearGradient>
+          </defs>
+          <Tooltip
+            content={<ChartTooltip formatter={formatter} labelFormatter={clockLabel} />}
+            cursor={{ stroke: '#334155', strokeWidth: 1 }}
+          />
+          <XAxis dataKey="ts" hide />
+          <YAxis hide domain={[0, 'auto']} />
+          <Area
+            type="monotone"
+            dataKey={dataKey}
+            name={name}
+            stroke={color}
+            strokeWidth={1.5}
+            fill={`url(#${id})`}
+            isAnimationActive={false}
+            dot={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}

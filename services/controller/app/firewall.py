@@ -10,7 +10,7 @@ import ipaddress
 import json
 import logging
 
-from . import netctl, settings, state
+from . import netctl, proxylists, settings, state, xray_build
 from .shell import out, run
 
 log = logging.getLogger("circle.firewall")
@@ -172,7 +172,7 @@ def validate_forwards(cfg):
 def _forward_nat_rules(cfg):
     """DNAT снаружи + hairpin изнутри для проброшенных портов."""
     wan_if = cfg["wan"]["interface"]
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     lan_ip = cfg["lan"]["address"]
     lan_net = str(state.lan_network(cfg))
     prerouting, postrouting = [], []
@@ -205,9 +205,22 @@ def _forward_nat_rules(cfg):
     return "\n".join(prerouting), "\n".join(postrouting)
 
 
+# Публичные резолверы, к которым браузеры и ОС сами ходят по DoH (443/TCP,
+# 443/UDP для DoH3). Только адреса, на которых нет ничего, кроме DNS, —
+# отказ на них не ломает обычные сайты.
+DOH_SERVERS = [
+    "8.8.8.8", "8.8.4.4",                                   # Google
+    "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",  # Cloudflare
+    "9.9.9.9", "149.112.112.112", "9.9.9.11", "149.112.112.11",        # Quad9
+    "94.140.14.14", "94.140.15.15",                         # AdGuard
+    "208.67.222.222", "208.67.220.220",                     # OpenDNS
+    "77.88.8.8", "77.88.8.1",                               # Яндекс
+]
+
+
 def base_ruleset(cfg):
     """filter + nat: фаервол хоста и NAT для LAN. Не зависит от статуса VPN."""
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     wan_if = cfg["wan"]["interface"]
     egress_pattern = state.wan_egress_pattern(cfg)
     lan_net = str(state.lan_network(cfg))
@@ -266,6 +279,55 @@ def base_ruleset(cfg):
 
     dnat_rules, hairpin_rules = _forward_nat_rules(cfg)
 
+    # Flowtable: установленные соединения идут коротким путём с ingress прямо
+    # в xmit, минуя forward/postrouting. Для PPPoE ядро разбирает сессионный
+    # заголовок на нижнем интерфейсе, поэтому в devices — физический WAN, а не
+    # ppp*. Устройство, которого нет, валит всю транзакцию — берём только живые.
+    ft_devices = [d for d in dict.fromkeys((lan_if, wan_if)) if netctl.iface_exists(d)]
+    flowtable, offload_rule = "", ""
+    if ft_devices:
+        joined = ", ".join(f'"{d}"' for d in ft_devices)
+        flowtable = (
+            "    flowtable ft {\n"
+            "        hook ingress priority filter;\n"
+            f"        devices = {{ {joined} }};\n"
+            "        counter;\n"
+            "    }\n\n"
+        )
+        offload_rule = "        ct state established meta l4proto { tcp, udp } flow add @ft\n"
+
+    smart = proxylists.enabled(cfg)
+    smart_cfg = cfg.get("smart_proxy") or {}
+    dns_hijack, dot_rule = "", ""
+    if smart and smart_cfg.get("hijack_dns", True):
+        # Умный прокси решает по DNS: запрос мимо dnsmasq не наполнит сет, и
+        # заблокированный сайт уйдёт напрямую. redirect подставляет основной
+        # адрес входящего интерфейса — это и есть listen-address dnsmasq.
+        dns_hijack = "".join(
+            f'        iifname "{lan_if}" ip daddr != {lan_ip} {proto} dport 53 '
+            f"redirect to :53\n" for proto in ("udp", "tcp"))
+    if smart and smart_cfg.get("block_dot", True):
+        dot_rule = (
+            "        # DNS-over-TLS в обход роутера: отказ, чтобы клиент откатился\n"
+            "        # на обычный DNS, который мы видим.\n"
+            f'        iifname "{lan_if}" tcp dport 853 reject with tcp reset\n'
+        )
+    doh_rule = ""
+    if smart and smart_cfg.get("block_doh", True):
+        # То же для DNS-over-HTTPS. Chrome, Windows 11 и Android, увидев в
+        # системе 8.8.8.8 или 1.1.1.1, сами переходят на DoH к тому же адресу —
+        # и роутер перестаёт видеть DNS: адреса YouTube не попадают в сет,
+        # видео идёт напрямую под провайдерский шейпер. Отказ на 443 к
+        # известным резолверам возвращает клиента на обычный DNS. Ставится и в
+        # forward, и в input: резолверы бывают в сете прокси, и тогда TPROXY
+        # доставляет соединение локально, мимо forward.
+        servers = ", ".join(smart_cfg.get("doh_servers") or DOH_SERVERS)
+        doh_rule = (
+            f'        iifname "{lan_if}" ip daddr {{ {servers} }} tcp dport 443 '
+            "reject with tcp reset\n"
+            f'        iifname "{lan_if}" ip daddr {{ {servers} }} udp dport 443 reject\n'
+        )
+
     return f"""\
 table inet {settings.NFT_FILTER}
 delete table inet {settings.NFT_FILTER}
@@ -273,6 +335,7 @@ table ip {settings.NFT_NAT}
 delete table ip {settings.NFT_NAT}
 
 table inet {settings.NFT_FILTER} {{
+{flowtable}\
     chain input {{
         # policy accept, а не drop: таблица живёт рядом с правилами Docker'а,
         # и промах в наших правилах не должен отрезать доступ к машине.
@@ -281,6 +344,7 @@ table inet {settings.NFT_FILTER} {{
 
         ct state established,related accept
         ct state invalid drop
+{doh_rule}\
         iif lo accept
         iifname "{lan_if}" accept
         meta l4proto {{ icmp, ipv6-icmp }} accept
@@ -293,8 +357,11 @@ table inet {settings.NFT_FILTER} {{
     chain forward {{
         type filter hook forward priority filter; policy accept;
 
+{offload_rule}\
         ct state established,related accept
         ct state invalid drop
+{dot_rule}\
+{doh_rule}\
         # PPPoE отдаёт MTU 1492: без подгонки MSS часть сайтов виснет на
         # больших пакетах, потому что ICMP fragmentation needed режут провайдеры.
         oifname "ppp*" tcp flags syn tcp option maxseg size set rt mtu
@@ -314,6 +381,7 @@ table ip {settings.NFT_NAT} {{
         # Чтобы панель открывалась просто по адресу роутера, без :{admin_port}.
         # Строго на его собственный адрес — иначе увели бы весь HTTP из LAN.
         iifname "{lan_if}" ip daddr {lan_ip} tcp dport 80 redirect to :{admin_port}
+{dns_hijack}\
 {dnat_rules}
     }}
 
@@ -327,55 +395,155 @@ table ip {settings.NFT_NAT} {{
 """
 
 
-def tproxy_ruleset(cfg, enabled):
-    """mangle: перехват LAN-трафика в TPROXY-инбаунд xray."""
-    head = (
-        f"table ip {settings.NFT_MANGLE}\n"
-        f"delete table ip {settings.NFT_MANGLE}\n"
-    )
-    if not enabled:
-        return head
+# ct mark соединения, которое умный режим отправил в прокси. Решение
+# принимается один раз на первом пакете: адрес, попавший в сет посреди уже
+# идущего прямого соединения, не должен утащить его хвост в xray (там нет
+# сокета — клиенту прилетел бы RST), и наоборот, истёкший элемент сета не
+# должен выдернуть из прокси живое соединение.
+SMART_CT_MARK = 0x100
 
-    lan_if = cfg["lan"]["interface"]
+
+def tproxy_ruleset(cfg, enabled):
+    """mangle: перехват LAN-трафика в TPROXY-инбаунд xray.
+
+    Таблицу не пересоздаём: в ней живёт сет proxy_dst, который наполняет
+    dnsmasq, и delete table стёр бы накопленные адреса при каждом «Применить»
+    и каждом переключении watchdog. `add` идемпотентен, а содержимое
+    статических сетов и цепочки переписываем через flush.
+    """
+    table = f"ip {settings.NFT_MANGLE}"
+    smart = proxylists.enabled(cfg)
+    static_nets = proxylists.cached_subnets(cfg) if smart else []
+    self_vpn = enabled and bool(cfg.get("self_vpn"))
+
+    script = [
+        f"add table {table}",
+        f"add set {table} bypass4 {{ type ipv4_addr; flags interval; }}",
+        f"add set {table} {proxylists.DYN_SET} "
+        "{ type ipv4_addr; size 65536; flags timeout; timeout 7d; }",
+        f"add set {table} {proxylists.STATIC_SET} {{ type ipv4_addr; flags interval; }}",
+        f"add chain {table} prerouting "
+        "{ type filter hook prerouting priority mangle; policy accept; }",
+        f"flush chain {table} prerouting",
+        # Цепочка заворота собственного трафика роутера объявляется всегда:
+        # пустая — значит выключен. Иначе при выключении self_vpn старые
+        # правила остались бы метить пакеты хоста в никуда.
+        f"add chain {table} output "
+        "{ type route hook output priority mangle; policy accept; }",
+        f"flush chain {table} output",
+        f"flush set {table} bypass4",
+        f"flush set {table} {proxylists.STATIC_SET}",
+        f"add element {table} bypass4 {{ {_bypass_elements(cfg)} }}",
+    ]
+    if static_nets:
+        script.append(f"add element {table} {proxylists.STATIC_SET} "
+                      f"{{ {', '.join(static_nets)} }}")
+    if not enabled:
+        # Пустая цепочка = TPROXY выключен (tproxy_active смотрит на её правила).
+        return "\n".join(script) + "\n"
+
+    lan_if = netctl.lan_device(cfg)
     port = int(cfg["tproxy"]["port"])
     mark = int(cfg["tproxy"]["fwmark"])
-    return head + f"""
-table ip {settings.NFT_MANGLE} {{
-    set bypass4 {{
-        type ipv4_addr
-        flags interval
-        elements = {{ {_bypass_elements(cfg)} }}
-    }}
-
-    chain prerouting {{
-        type filter hook prerouting priority mangle; policy accept;
-
-        ip daddr @bypass4 accept
+    chain = f"add rule {table} prerouting"
+    if self_vpn:
+        script.append(f"add set {table} selfvpn_skip "
+                      "{ type ipv4_addr; flags interval; }")
+        script.append(f"flush set {table} selfvpn_skip")
+        endpoints = xray_build.wireguard_endpoints(cfg)
+        if endpoints:
+            script.append(f"add element {table} selfvpn_skip "
+                          f"{{ {', '.join(endpoints)} }}")
+        # Пакеты, уже переразмеченные output-цепочкой ниже: re-route в
+        # таблицу tproxy возвращает их с iif lo — снимаем тем же инбаундом,
+        # что и LAN (dokodemo-door всё равно слушает на всех адресах).
+        script.append(f'{chain} iifname "lo" meta mark {mark} '
+                      f'meta l4proto {{ tcp, udp }} tproxy to :{port} '
+                      f"meta mark set {mark} accept")
+    script += [
+        f"{chain} ip daddr @bypass4 accept",
         # Обращения к собственным адресам роутера (включая внешний) в прокси не
         # заворачиваем: иначе hairpin-проброс уезжает в VPN вместо DNAT.
-        fib daddr type local accept
+        f"{chain} fib daddr type local accept",
         # Проброшенные порты мимо прокси — обязательно раньше tproxy-правил.
         # Ответ проброса идёт из LAN на публичный адрес клиента и выглядит как
         # обычный исходящий трафик: TPROXY утаскивал его в xray, соединение
         # рассыпалось, а инициатору прилетал RST.
-        ct status dnat accept
-        # Заворачиваем только транзит из LAN. Трафик, пришедший с WAN (в том
-        # числе наш SSH), не трогаем вообще.
-        iifname "{lan_if}" meta l4proto tcp tproxy to :{port} meta mark set {mark} accept
-        iifname "{lan_if}" meta l4proto udp tproxy to :{port} meta mark set {mark} accept
-    }}
-}}
-"""
+        f"{chain} ct status dnat accept",
+    ]
+    # Заворачиваем только транзит из LAN. Трафик, пришедший с WAN (в том
+    # числе наш SSH), не трогаем вообще.
+    if smart:
+        if (cfg.get("smart_proxy") or {}).get("hijack_dns", True):
+            # DNS — мимо TPROXY, к перехвату на dnsmasq. mangle срабатывает
+            # раньше nat: запрос на 8.8.8.8:53 (а 8.8.8.8 сам лежит в сете
+            # прокси) уходил в xray, ответ не попадал в nftset, и адреса
+            # видеосерверов YouTube шли напрямую под шейпер провайдера.
+            script.append(f'{chain} iifname "{lan_if}" meta l4proto {{ tcp, udp }} '
+                          "th dport 53 accept")
+        for set_name in (proxylists.DYN_SET, proxylists.STATIC_SET):
+            script.append(f'{chain} iifname "{lan_if}" ct state new '
+                          f"ip daddr @{set_name} ct mark set {SMART_CT_MARK}")
+        match = f'iifname "{lan_if}" ct mark {SMART_CT_MARK}'
+    else:
+        match = f'iifname "{lan_if}"'
+    for proto in ("tcp", "udp"):
+        script.append(f"{chain} {match} meta l4proto {proto} "
+                      f"tproxy to :{port} meta mark set {mark} accept")
+
+    if self_vpn:
+        out_chain = f"add rule {table} output"
+        script += [
+            # Пакеты самого xray: аутбаундам при self_vpn проставлен
+            # sockopt.mark (xray_build.build) — из заворота их выпускаем
+            # первым же правилом, иначе каждый аутбаунд зациклится сам в себя.
+            f"{out_chain} meta mark {settings.XRAY_MARK:#x} return",
+            # TPROXY переносит только tcp/udp: пинг и прочий icmp из консоли
+            # остаются прямыми, а не рвутся на переразмеченном маршруте.
+            f"{out_chain} meta l4proto icmp return",
+            f"{out_chain} fib daddr type local return",
+            f"{out_chain} ip daddr @bypass4 return",
+            # DNS хоста (systemd-resolved, upstream dnsmasq) и DHCP-офферы —
+            # напрямую: без петли резолва и вразрез с выдачей адресов.
+            f"{out_chain} meta l4proto {{ tcp, udp }} th dport 53 return",
+            f"{out_chain} udp sport 67 return",
+            # UDP-инкапсуляция wireguard-серверов, если xray проигнорировал
+            # sockopt.mark на этом аутбаунде.
+            f"{out_chain} ip daddr @selfvpn_skip return",
+            # Дальше сработает ip rule fwmark -> таблица tproxy (local dev lo),
+            # а prerouting-правило выше снимет пакет тем же tproxy-инбаундом.
+            f"{out_chain} meta mark set {mark}",
+        ]
+    return "\n".join(script) + "\n"
+
+
+def self_vpn_active():
+    """Заворот локального трафика: непустая цепочка output (управляется
+    watchdog'ом синхронно с TPROXY)."""
+    return "meta mark set" in out(["nft", "list", "chain", "ip",
+                                   settings.NFT_MANGLE, "output"])
+
+
+ACCT_FAMILY = "netdev"
 
 
 def acct_ruleset(cfg):
-    """Пер-клиентский учёт трафика через dynamic set со счётчиками."""
-    lan_if = cfg["lan"]["interface"]
+    """Пер-клиентский учёт трафика через dynamic set со счётчиками.
+
+    Считаем на ingress/egress LAN-порта, а не в forward: flowtable пускает
+    установленные соединения мимо forward, и счётчики там замерли бы на первых
+    пакетах. Заодно учитывается трафик, завёрнутый в xray, — он вообще не
+    транзитный и в forward не попадал никогда.
+    """
+    lan_if = netctl.lan_device(cfg)
+    lan_net = str(state.lan_network(cfg))
     return f"""\
 table inet {settings.NFT_ACCT}
 delete table inet {settings.NFT_ACCT}
+table {ACCT_FAMILY} {settings.NFT_ACCT}
+delete table {ACCT_FAMILY} {settings.NFT_ACCT}
 
-table inet {settings.NFT_ACCT} {{
+table {ACCT_FAMILY} {settings.NFT_ACCT} {{
     set clients_up {{
         type ipv4_addr
         size 4096
@@ -391,10 +559,15 @@ table inet {settings.NFT_ACCT} {{
         counter
     }}
 
+    # Раньше flowtable (priority filter), чтобы видеть каждый пакет.
     chain accounting {{
-        type filter hook forward priority -150; policy accept;
-        iifname "{lan_if}" update @clients_up {{ ip saddr }}
-        oifname "{lan_if}" update @clients_down {{ ip daddr }}
+        type filter hook ingress device "{lan_if}" priority -500; policy accept;
+        ip saddr {lan_net} ip daddr != {lan_net} update @clients_up {{ ip saddr }}
+    }}
+
+    chain accounting_out {{
+        type filter hook egress device "{lan_if}" priority -500; policy accept;
+        ip daddr {lan_net} ip saddr != {lan_net} update @clients_down {{ ip daddr }}
     }}
 }}
 """
@@ -420,7 +593,7 @@ DOCKER_RULE_COMMENT = "circle-router"
 
 
 def docker_user_rules(cfg):
-    lan_if = cfg["lan"]["interface"]
+    lan_if = netctl.lan_device(cfg)
     wan_if = cfg["wan"]["interface"]
     uplink = cfg.get("uplink_access") or {}
     wan_set = f'{{ "{wan_if}", "ppp*" }}'
@@ -493,9 +666,9 @@ def apply_tproxy(cfg, enabled):
 
 def apply_accounting(cfg, force=False):
     """Пересоздаём таблицу учёта только при нужде — иначе обнулим счётчики."""
-    if not force and table_exists("inet", settings.NFT_ACCT):
-        chain = out(["nft", "list", "chain", "inet", settings.NFT_ACCT, "accounting"])
-        if f'"{cfg["lan"]["interface"]}"' in chain:
+    if not force and table_exists(ACCT_FAMILY, settings.NFT_ACCT):
+        chain = out(["nft", "list", "chain", ACCT_FAMILY, settings.NFT_ACCT, "accounting"])
+        if f'"{netctl.lan_device(cfg)}"' in chain:
             return False
     _nft(acct_ruleset(cfg))
     return True
@@ -516,7 +689,7 @@ def client_counters():
     """{ip: {"up": bytes, "down": bytes}} из dynamic-сетов nftables."""
     result = {}
     for set_name, key in (("clients_up", "up"), ("clients_down", "down")):
-        raw = out(["nft", "-j", "list", "set", "inet", settings.NFT_ACCT, set_name])
+        raw = out(["nft", "-j", "list", "set", ACCT_FAMILY, settings.NFT_ACCT, set_name])
         if not raw:
             continue
         try:
@@ -545,6 +718,7 @@ def teardown():
             ("ip", settings.NFT_NAT),
             ("ip", settings.NFT_MANGLE),
             ("inet", settings.NFT_ACCT),
+            (ACCT_FAMILY, settings.NFT_ACCT),
         )
     )
     _nft(script)

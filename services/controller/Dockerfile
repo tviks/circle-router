@@ -37,11 +37,13 @@ RUN set -eux; \
 FROM python:3.12-slim-bookworm
 
 # nftables/iproute2 — правила и роутинг на хосте; ppp + pppoe — WAN по PPPoE;
-# kmod — modprobe для nf_tproxy и pppoe.
+# kmod — modprobe для nf_tproxy, pppoe и wifi-драйвера; hostapd — точка
+# доступа (nl80211 хоста виден из host netns, как и pppd); iw и usbutils
+# (lsusb) — статус wifi-адаптера (wifi.py); curl — общий спидтест.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      nftables iproute2 iputils-ping kmod procps ppp pppoe ca-certificates \
-      conntrack tcpdump \
+      nftables iproute2 iputils-ping kmod procps ppp pppoe hostapd \
+      iw usbutils ca-certificates conntrack tcpdump curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

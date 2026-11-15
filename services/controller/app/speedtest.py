@@ -59,7 +59,7 @@ def _wait_port(port, timeout=STARTUP_TIMEOUT):
     return False
 
 
-def _probe_config(outbound, port):
+def _probe_config(outbound, port, extras=()):
     return {
         "log": {"loglevel": "error"},
         "inbounds": [{
@@ -70,7 +70,7 @@ def _probe_config(outbound, port):
             "settings": {"allowTransparent": False},
         }],
         # Первый аутбаунд — дефолтный, поэтому весь трафик пробы уходит в него.
-        "outbounds": [outbound, {"tag": "direct", "protocol": "freedom"}],
+        "outbounds": [outbound, *extras, {"tag": "direct", "protocol": "freedom"}],
     }
 
 
@@ -135,7 +135,8 @@ def test_server(server, cfg):
     port = _free_port()
     config_path = settings.XRAY_CONFIG_PATH.parent / f"probe-{port}.json"
     config_path.write_text(
-        json.dumps(_probe_config(outbound, port), ensure_ascii=False), encoding="utf-8")
+        json.dumps(_probe_config(outbound, port, xray_build.extra_outbounds_for(server)),
+                   ensure_ascii=False), encoding="utf-8")
 
     ok, output = xray_build.validate(config_path)
     if not ok:

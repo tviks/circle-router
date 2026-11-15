@@ -41,10 +41,27 @@ export const api = {
   status: () => request('/status'),
   interfaces: () => request('/interfaces'),
   system: () => request('/system'),
+  wifi: () => request('/wifi'),
 
   getConfig: () => request('/config'),
   patchConfig: (patch) => request('/config', { method: 'POST', body: patch }),
   apply: () => request('/apply', { method: 'POST' }),
+
+  // Бэкап — файл с секретами, поэтому качаем через fetch с cookie сессии,
+  // а не прямой ссылкой: <a href> не пройдёт авторизацию.
+  backup: async () => {
+    const response = await fetch(BASE + '/backup', { credentials: 'same-origin' })
+    if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status)
+    const disposition = response.headers.get('Content-Disposition') || ''
+    const match = disposition.match(/filename="([^"]+)"/)
+    const url = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = url
+    link.download = match?.[1] || 'circle-router-backup.json'
+    link.click()
+    URL.revokeObjectURL(url)
+  },
+  restore: (payload) => request('/restore', { method: 'POST', body: payload }),
 
   servers: () => request('/servers'),
   addServer: (server) => request('/servers', { method: 'POST', body: server }),
@@ -71,6 +88,22 @@ export const api = {
 
   speedtestStatus: () => request('/speedtest'),
   speedtestStart: (server_ids) => request('/speedtest', { method: 'POST', body: { server_ids } }),
+
+  wanspeed: () => request('/wanspeed'),
+  wanspeedStart: (paths, duration = 10) =>
+    request('/wanspeed', { method: 'POST', body: { paths, duration } }),
+
+  nodes: () => request('/nodes'),
+  createNode: (payload) => request('/nodes', { method: 'POST', body: payload }),
+  editNode: (id, payload) => request(`/nodes/${id}`, { method: 'PUT', body: payload }),
+  deleteNode: (id, wipe = true) => request(`/nodes/${id}?wipe=${wipe}`, { method: 'DELETE' }),
+  redeployNode: (id, credentials = {}) =>
+    request(`/nodes/${id}/deploy`, { method: 'POST', body: credentials }),
+  tuneNode: (id) => request(`/nodes/${id}/tune`, { method: 'POST' }),
+  applyNodeProfile: (id, key) => request(`/nodes/${id}/apply`, { method: 'POST', body: { key } }),
+  restartNode: (id) => request(`/nodes/${id}/restart`, { method: 'POST' }),
+  forgetNodeHostKey: (id) => request(`/nodes/${id}/forget-host-key`, { method: 'POST' }),
+  nodeMetrics: (id) => request(`/nodes/${id}/metrics`),
 
   logs: (service, tail = 300) => request(`/logs/${service}?tail=${tail}`),
   restartService: (service) => request(`/services/${service}/restart`, { method: 'POST' }),
