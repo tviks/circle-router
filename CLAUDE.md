@@ -31,6 +31,8 @@ services/controller/      FastAPI-мозг, privileged; в образе есть
   app/node_monitor.py     метрики нод: поток `cat /proc` по SSH
   app/proxylists.py       умный прокси: списки доменов/подсетей → dnsmasq nftset + nft-сеты
   app/wanspeed.py         общий спидтест (curl, 4 потока; direct и через health-in)
+  app/wifi.py             точка доступа: hostapd-супервизор (как pppd), статус
+                          и клиенты через `iw`, валидация секции wifi
 web/                      React + Vite + Tailwind; страницы в src/pages, UI-кит в
                           src/components/ui.jsx, API-клиент src/lib/api.js
 ```
@@ -49,6 +51,23 @@ web/                      React + Vite + Tailwind; страницы в src/pages
 - Watchdog снимает TPROXY, если xray не слушает порт ИЛИ (failover включён и)
   `tunnel.monitor` не в состоянии `up`. Состояние watchdog: `up` / `down` /
   `failover`.
+- `self_vpn` — заворот собственного трафика роутера (apt/docker/curl из
+  консоли) в туннель: output-цепочка в `circle_mangle` метит пакеты fwmark'ом
+  TPROXY → policy routing на lo → prerouting-правило `iif lo` отдаёт их в тот
+  же tproxy-инбаунд. Аутбаундам xray проставляется `sockopt.mark 0xff`
+  (`settings.XRAY_MARK`) — до этого mark'ов у xray принципиально не было;
+  output-цепочка выпускает их первым правилом, иначе петля. Мимо заворота:
+  icmp, порт 53, DHCP (sport 67), bypass4, wireguard-эндпоинты (сет
+  `selfvpn_skip`; доменный WG-эндпоинт при self_vpn требует IP — см.
+  `xray_build.selfvpn_problems`). Снимается watchdog'ом синхронно с TPROXY.
+- WiFi (`wifi` в конфиге, вкладка WiFi): hostapd в контейнере контроллера
+  (nl80211 хоста виден из host netns), wlan-интерфейс — член `br-lan`
+  (`netctl.lan_members` добавляет его при `wifi.enabled`), клиенты = обычные
+  клиенты LAN. Супервизор — по образцу pppoe (поколения, рестарт 5 с).
+  ACS у rtw88 не работает — канал только фиксированный 1–13. Адаптер
+  RTL8811CU из CD-ROM (`0bda:1a2b`) переводит usb_modeswitch на хосте
+  (`/etc/usb_modeswitch.d/0bda:1a2b`), имя wlan0 даёт systemd .link
+  (`Driver=rtw88_8821cu`); в образе контроллера нужны hostapd, iw, usbutils.
 - `health-in` — HTTP-инбаунд xray на 127.0.0.1:10809, всегда → `proxy`. Через него
   ходят монитор туннеля и SSH метрик нод (внутри туннеля).
 - Сервер в `cfg.servers` может иметь `outbound` + `extra_outbounds` (у нод —
