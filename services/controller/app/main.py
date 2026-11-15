@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from . import (adblock, apply, auth, db, dnslog, dnsmasq_cfg, dockerctl,
                firewall, geodat, netctl, node_monitor, nodes, pppoe, proxylists,
                settings, speedtest, state, stats, subscription, sysinfo, tunnel,
-               wanspeed, xray_build, xray_url)
+               wanspeed, wifi, xray_build, xray_url)
 
 logging.basicConfig(
     level=os.environ.get("CR_LOG_LEVEL", "INFO"),
@@ -30,7 +30,8 @@ app = FastAPI(title="circle-router", docs_url=None, redoc_url=None)
 # Ключи конфига, которые панель имеет право менять.
 EDITABLE = {"vpn_enabled", "bypass", "force_proxy", "wan", "lan", "dhcp", "dns",
             "tproxy", "firewall", "uplink_access", "port_forward", "adblock",
-            "speedtest", "block_quic", "bypass_torrents", "log_level", "failover"}
+            "speedtest", "block_quic", "bypass_torrents", "log_level", "failover",
+            "wifi"}
 
 
 # ── схемы запросов ───────────────────────────────────────────────────────────
@@ -224,6 +225,7 @@ def status(_: str = Depends(auth.require_user)):
                    "networks": firewall.uplink_networks(cfg)},
         "services": _service_status(),
         "pppoe": pppoe.status() if cfg["wan"].get("mode") == "pppoe" else None,
+        "wifi": wifi.status(cfg),
         "host": {
             "uptime": netctl.host_uptime(),
             "loadavg": netctl.loadavg(),
@@ -247,6 +249,12 @@ def api_interfaces(_: str = Depends(auth.require_user)):
     return netctl.interfaces()
 
 
+@app.get("/api/wifi")
+def api_wifi(_: str = Depends(auth.require_user)):
+    """Живой статус точки доступа: адаптер, hostapd, канал, клиенты."""
+    return wifi.status(state.load())
+
+
 # ── конфигурация ─────────────────────────────────────────────────────────────
 
 @app.get("/api/config")
@@ -257,6 +265,9 @@ def get_config(_: str = Depends(auth.require_user)):
     safe["wan"] = dict(cfg["wan"])
     safe["wan"]["pppoe"] = dict(cfg["wan"]["pppoe"])
     safe["wan"]["pppoe"]["password"] = "••••••" if cfg["wan"]["pppoe"].get("password") else ""
+    # То же для пароля WiFi-точки.
+    safe["wifi"] = dict(cfg.get("wifi") or {})
+    safe["wifi"]["password"] = "••••••" if safe["wifi"].get("password") else ""
     # Ноды живут в своём API: в них ключи Reality и сертификаты.
     safe.pop("nodes", None)
     return safe
@@ -274,11 +285,14 @@ def post_config(patch: dict, _: str = Depends(auth.require_user)):
         # Маскированный пароль из GET /api/config не должен затирать настоящий.
         if not str(pppoe_patch.get("password") or "").strip("•"):
             pppoe_patch.pop("password", None)
+        wifi_patch = (patch.get("wifi") or {})
+        if not str(wifi_patch.get("password") or "").strip("•"):
+            wifi_patch.pop("password", None)
         _merge(cfg, patch)
 
     cfg = state.update(mutate)
     problems = dnsmasq_cfg.validate(cfg) + firewall.validate_forwards(cfg) \
-        + netctl.validate_lan(cfg)
+        + netctl.validate_lan(cfg) + wifi.validate(cfg)
     return {"ok": not problems, "problems": problems, "config": get_config()}
 
 

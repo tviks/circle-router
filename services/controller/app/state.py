@@ -162,6 +162,16 @@ def _default_config():
         },
         # Свои VDS-ноды, развёрнутые из панели (см. nodes.py).
         "nodes": [],
+        # Точка доступа на USB WiFi (hostapd, см. wifi.py): клиенты включаются
+        # в LAN-мост и живут по тем же правилам, что проводные.
+        "wifi": {
+            "enabled": False,
+            "ssid": "CircleRouter",
+            "password": "",
+            "channel": 6,       # фиксированный: ACS у rtw88 не работает
+            "hidden": False,
+            "interface": "",    # пусто = первый wlan* интерфейс
+        },
         # Оставлено для провайдеров, которые давят UDP/443: по умолчанию
         # QUIC идёт в VPN, как и остальной UDP.
         "block_quic": False,

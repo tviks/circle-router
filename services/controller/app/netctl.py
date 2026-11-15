@@ -92,6 +92,19 @@ def iface_exists(name):
     return bool(name) and (Path("/sys/class/net") / name).exists()
 
 
+def first_wlan():
+    """Первый беспроводной интерфейс (обычно wlan0). Пустая строка, если
+    адаптера нет: не воткнут, драйвер не загружен или донгл ещё в режиме
+    CD-ROM и ждёт usb_modeswitch."""
+    try:
+        for path in sorted(Path("/sys/class/net").iterdir()):
+            if path.name.startswith("wlan") and (path / "wireless").exists():
+                return path.name
+    except OSError:
+        pass
+    return ""
+
+
 def lan_members(cfg):
     """Все физические порты, которые должны работать как LAN.
 
@@ -105,6 +118,15 @@ def lan_members(cfg):
         port = (port or "").strip()
         if port and port not in members:
             members.append(port)
+    # Точка доступа wifi: интерфейс — полноценный член бриджа, его клиенты
+    # получают DHCP и правила TPROXY с lan_device. Адаптера нет — член просто
+    # не добавляется, watcher'ы (watchdog, hostapd) дождутся железа; несуществующий
+    # интерфейс из конфига тоже не добавляем, иначе bridge_ok вечно «сломан».
+    wifi = cfg.get("wifi") or {}
+    if wifi.get("enabled"):
+        iface = (wifi.get("interface") or "").strip() or first_wlan()
+        if iface and iface not in members and iface_exists(iface):
+            members.append(iface)
     return members
 
 

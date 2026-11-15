@@ -5,7 +5,7 @@ import threading
 import time
 
 from . import (adblock, dnsmasq_cfg, dockerctl, firewall, netctl, pppoe,
-               proxylists, settings, state, tunnel, xray_build)
+               proxylists, settings, state, tunnel, wifi, xray_build)
 from .shell import run
 
 log = logging.getLogger("circle.apply")
@@ -49,6 +49,7 @@ def reconcile(restart_services=True):
         errors.extend(dhcp_problems)
         errors.extend(firewall.validate_forwards(cfg))
         errors.extend(netctl.validate_lan(cfg))
+        errors.extend(wifi.validate(cfg))
 
         members = netctl.lan_members(cfg)
         netctl.mark_unmanaged(members)
@@ -67,6 +68,15 @@ def reconcile(restart_services=True):
         # наоборот, после отказа от свича в бридже) — сгоняем, иначе ARP flux.
         netctl.prune_member_addresses(members, state.lan_network(cfg), keep=device)
         steps.append(f"LAN {device} -> {address}")
+
+        # Точка доступа — после сборки бриджа (hostapd enslavит wlan сам, но
+        # бридж уже должен существовать) и до рестартов сервисов.
+        try:
+            message = wifi.apply(cfg)
+            if message:
+                steps.append(message)
+        except Exception as exc:                       # noqa: BLE001
+            errors.append(f"WiFi: {exc}")
 
         mode = cfg["wan"].get("mode", "dhcp")
         if mode == "pppoe":

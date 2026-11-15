@@ -41,6 +41,7 @@ export const api = {
   status: () => request('/status'),
   interfaces: () => request('/interfaces'),
   system: () => request('/system'),
+  wifi: () => request('/wifi'),
 
   getConfig: () => request('/config'),
   patchConfig: (patch) => request('/config', { method: 'POST', body: patch }),

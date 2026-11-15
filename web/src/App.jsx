@@ -12,6 +12,7 @@ import {
   ShieldCheck,
   Terminal,
   Users,
+  Wifi,
   X,
 } from 'lucide-react'
 
@@ -23,6 +24,7 @@ import Overview from './pages/Overview'
 import Vpn from './pages/Vpn'
 import Nodes from './pages/Nodes'
 import Network from './pages/Network'
+import WifiPage from './pages/Wifi'
 import Clients from './pages/Clients'
 import AdBlock from './pages/AdBlock'
 import System from './pages/System'
@@ -32,6 +34,7 @@ const PAGES = [
   { id: 'vpn', label: 'VPN', icon: ShieldCheck, component: Vpn },
   { id: 'nodes', label: 'Свои ноды', icon: Server, component: Nodes },
   { id: 'network', label: 'Сеть', icon: Cable, component: Network },
+  { id: 'wifi', label: 'WiFi', icon: Wifi, component: WifiPage },
   { id: 'adblock', label: 'Блокировщик', icon: ShieldBan, component: AdBlock },
   { id: 'clients', label: 'Клиенты', icon: Users, component: Clients },
   { id: 'system', label: 'Система', icon: Terminal, component: System },
