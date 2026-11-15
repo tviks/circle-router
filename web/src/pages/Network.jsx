@@ -711,6 +711,9 @@ function PortForward({ section, onChange, lanNetwork, wanAddress }) {
 }
 
 function Reservations({ items, onChange }) {
+  // Подсказки из живых аренд: удобнее выбрать MAC/IP устройства, чем копировать
+  // их со страницы «Клиенты» (или с наклейки под роутером).
+  const { data: clients } = usePoll(api.clients, 20000)
   const rows = items ?? []
   const update = (index, key, value) => {
     const next = rows.map((row, i) => (i === index ? { ...row, [key]: value } : row))
@@ -731,6 +734,21 @@ function Reservations({ items, onChange }) {
       }
       bodyClass={rows.length ? 'card-pad' : 'p-0'}
     >
+      <datalist id="reservation-macs">
+        {(clients ?? []).filter((c) => c.mac).map((c) => (
+          <option key={c.mac} value={c.mac}>
+            {c.hostname || c.ip}
+          </option>
+        ))}
+      </datalist>
+      <datalist id="reservation-ips">
+        {(clients ?? []).filter((c) => c.mac).map((c) => (
+          <option key={c.ip} value={c.ip}>
+            {c.hostname || c.mac}
+          </option>
+        ))}
+      </datalist>
+
       {rows.length === 0 ? (
         <p className="px-6 py-8 text-center text-sm text-slate-600">Резерваций нет.</p>
       ) : (
@@ -738,11 +756,13 @@ function Reservations({ items, onChange }) {
           {rows.map((row, index) => (
             <div key={index} className="grid gap-3 sm:grid-cols-[1.2fr_1fr_1fr_auto]">
               <Input
+                list="reservation-macs"
                 value={row.mac}
                 onChange={(e) => update(index, 'mac', e.target.value)}
                 placeholder="aa:bb:cc:dd:ee:ff"
               />
               <Input
+                list="reservation-ips"
                 value={row.ip}
                 onChange={(e) => update(index, 'ip', e.target.value)}
                 placeholder="192.168.10.50"
